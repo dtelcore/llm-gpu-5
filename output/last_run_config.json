@@ -1,0 +1,17 @@
+{
+    "vocab_size": 4096,
+    "max_len": 256,
+    "embedding_dim": 384,
+    "num_heads": 12,
+    "num_layers": 2,
+    "attention_impl": "strided",
+    "batch_size": 1,
+    "grad_accum": 64,
+    "learning_rate": 9e-05,
+    "total_steps": 100000,
+    "dataset": "tinystories_500mb.txt",
+    "corpus_limit": 3000000,
+    "name": "deep",
+    "preset_name": "custom",
+    "init_checkpoint_path": "output\\checkpoints\\gpt_10000steps_1p0e-05lr_ctx256_deep_384d_12h_2l_20260621_200238.best.npz"
+}

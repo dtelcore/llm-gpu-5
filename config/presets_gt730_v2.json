@@ -1,0 +1,19 @@
+{
+  "presets_by_category": {
+    "shallow": [
+      {"key": "1", "name": "micro", "embedding_dim": 16, "num_heads": 1, "num_layers": 1, "note": "smoke tests"},
+      {"key": "2", "name": "tiny", "embedding_dim": 32, "num_heads": 2, "num_layers": 1, "note": "quick debug runs"},
+      {"key": "3", "name": "small", "embedding_dim": 32, "num_heads": 4, "num_layers": 2, "note": "recommended GT730 baseline"}
+    ],
+    "knee_deep": [
+      {"key": "4", "name": "base", "embedding_dim": 128, "num_heads": 8, "num_layers": 2, "note": "practical multi-layer"},
+      {"key": "5", "name": "large", "embedding_dim": 256, "num_heads": 8, "num_layers": 3, "note": "medium production model"},
+      {"key": "6", "name": "xl", "embedding_dim": 512, "num_heads": 8, "num_layers": 4, "note": "max practical on GT730"}
+    ],
+    "head_above_water": [
+      {"key": "7", "name": "xxl", "embedding_dim": 640, "num_heads": 10, "num_layers": 4, "note": "large experimental model"},
+      {"key": "8", "name": "giant", "embedding_dim": 896, "num_heads": 14, "num_layers": 5, "note": "~15M params, aggressive"},
+      {"key": "9", "name": "deep", "embedding_dim": 384, "num_heads": 12, "num_layers": 2, "note": "narrow alternative to giant"}
+    ]
+  }
+}
