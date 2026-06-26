@@ -21,6 +21,8 @@ import pycuda.driver as cuda
 # Force initial system driver context initialization mappings
 import env_config
 import pycuda.autoinit
+import subprocess
+import sys
 
 from corpus_utils import (
     TRAINING_CORPUS,
@@ -38,6 +40,7 @@ from core.loss import SoftmaxCrossEntropy
 from gpu_memory import install_global_memory_pool, get_memory_pool_stats_mb, free_held_pool_blocks
 from training_metrics import TrainingMetrics
 from run_config import RunConfig
+from scheduler import CosineWarmupScheduler
 
 
 GOAL_LOSS_THRESHOLD = 2.0
@@ -87,6 +90,9 @@ def run_training_engine():
     logger.info(f"Shared tokenizer vocab built from {len(tokenizer_docs):,} documents ({tokenizer_source})")
     logger.info(f"Vocabulary Size Extracted: {tokenizer.vocab_size} tokens")
     logger.info(f"Special Tokens: BOS={tokenizer.BOS_ID}, PAD={tokenizer.PAD_ID}")
+    
+    vocab_path = f"output/checkpoints/vocab_{run_config.name}.json"
+    tokenizer.save_vocab(vocab_path)
 
     # 3. Establish strict network boundaries optimized for low VRAM footprints
     B = run_config.batch_size
@@ -185,6 +191,8 @@ def run_training_engine():
 
     metrics = TrainingMetrics(total_steps=total_steps, log_interval=1, backend="cuda")
     metrics.start()
+    
+    scheduler = CosineWarmupScheduler(max_lr=learning_rate, total_steps=total_steps, warmup_steps=min(200, total_steps // 10))
 
     try:
         for step in range(1, total_steps + 1):
@@ -252,21 +260,34 @@ def run_training_engine():
                 model.free_forward_caches()
             
             # --- PHASE D: STATEFUL ADAMW WEIGHT OPTIMIZATION STEP ---
-            model.update_weights(lr=learning_rate, step=step)
-            logger.debug(f"Step {step}: AdamW weight update applied")
+            current_lr = scheduler.get_lr(step)
+            model.update_weights(lr=current_lr, step=step)
+            logger.debug(f"Step {step}: AdamW weight update applied (lr={current_lr:.6f})")
             pool_used_mb, pool_total_mb = get_memory_pool_stats_mb()
 
             metrics.step_end(
                 loss_value,
-                lr=learning_rate,
+                lr=current_lr,
                 grad_norm=grad_norm,
                 batch_tokens=batch_tokens,
                 pool_used_mb=pool_used_mb,
                 pool_total_mb=pool_total_mb,
                 val_loss=val_loss,
             )
+            
+            if step % 1000 == 0:
+                try:
+                    subprocess.Popen([sys.executable, "training_log_plotter.py", "--save", "output/training_metrics_latest.png", "--no-forecast"])
+                    subprocess.Popen([sys.executable, "loss_landscape_plotter.py"])
+                except Exception as e:
+                    logger.warning(f"Plotter failed to launch: {e}")
 
         metrics.finalize()
+        try:
+            subprocess.Popen([sys.executable, "training_log_plotter.py", "--save", "output/training_metrics_latest.png", "--no-forecast"])
+            subprocess.Popen([sys.executable, "loss_landscape_plotter.py"])
+        except Exception:
+            pass
         logger.info(f"\nGoal Metrics:")
         logger.info(f"  Target loss:      < {GOAL_LOSS_THRESHOLD:.2f}")
         logger.info(f"  Target PPL:       < {GOAL_PPL_THRESHOLD:.2f}")

@@ -236,17 +236,17 @@ class CausalSoftmax:
                   block=(threads, 1, 1), grid=(blocks, 1))
 
 
-class Activation:
-    """In-Place ReLU Activation Function.
+class GELU:
+    """In-Place GELU Activation Function.
     
-    Applies ReLU (max(0, x)) to tensor in-place, used in FFN hidden layers.
+    Applies GELU to tensor in-place, used in FFN hidden layers.
     Saves VRAM by modifying input tensor directly.
     """
     def __init__(self):
         self.func = _SHARED_GPU_MODULE.get_function("activation_kernel")
         
     def __call__(self, gpu_data, total_elements: int):
-        """Execute ReLU activation kernel.
+        """Execute GELU activation kernel.
         
         Args:
             gpu_data: GPU pointer to tensor (modified in-place) (float32)

@@ -17,6 +17,8 @@ Key improvements over v1:
 import argparse
 import re
 import sys
+import json
+import csv
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -68,30 +70,66 @@ def _parse_log_file(path: Path) -> Optional[RunSeries]:
     metrics: Dict[str, List[Optional[float]]] = {}
     total_steps = 0
 
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            if "[train][cuda]" not in line and "[train]" not in line:
-                continue
-            step_match = LOG_LINE_RE.search(line)
-            if not step_match:
-                continue
-            step = int(step_match.group(1))
-            total_steps = max(total_steps, int(step_match.group(2)))
-            steps.append(step)
-
-            row: Dict[str, Optional[float]] = {}
-            for key, raw in KV_RE.findall(line):
-                if key == "step":
+    if path.suffix == ".jsonl":
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    step = int(data.get("step", 0))
+                    if not step: continue
+                    steps.append(step)
+                    total_steps = max(total_steps, step)
+                    for k, v in data.items():
+                        if k == "step": continue
+                        metrics.setdefault(k, []).append(_safe_float(str(v)) if v is not None else None)
+                except Exception:
+                    pass
+    elif path.suffix == ".csv":
+        with path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    step = int(row.get("step", 0))
+                    if not step: continue
+                    steps.append(step)
+                    total_steps = max(total_steps, step)
+                    for k, v in row.items():
+                        if k == "step": continue
+                        metrics.setdefault(k, []).append(_safe_float(v) if v else None)
+                except Exception:
+                    pass
+    else:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if "[train][cuda]" not in line and "[train]" not in line:
                     continue
-                row[key] = _safe_float(raw)
+                step_match = LOG_LINE_RE.search(line)
+                if not step_match:
+                    continue
+                step = int(step_match.group(1))
+                total_steps = max(total_steps, int(step_match.group(2)))
+                steps.append(step)
 
-            for key in row:
-                metrics.setdefault(key, [])
-            for key in list(metrics):
-                metrics[key].append(row.get(key))
+                row: Dict[str, Optional[float]] = {}
+                for key, raw in KV_RE.findall(line):
+                    if key == "step":
+                        continue
+                    row[key] = _safe_float(raw)
+
+                for key in row:
+                    metrics.setdefault(key, [])
+                for key in list(metrics):
+                    metrics[key].append(row.get(key))
 
     if not steps:
         return None
+        
+    # Pad to equal length
+    max_len = len(steps)
+    for k in metrics:
+        if len(metrics[k]) < max_len:
+            metrics[k].extend([None] * (max_len - len(metrics[k])))
+            
     return RunSeries(name=path.stem, path=path, steps=steps,
                      total_steps=total_steps, metrics=metrics)
 
@@ -459,18 +497,20 @@ def _render_figure(fig, runs: Sequence[RunSeries], metric_name: str,
                    forecast_window: int, forecast_enabled: bool,
                    forecast_use_smoothed: bool, show_raw_loss: bool,
                    show_ema_loss: bool, show_raw_metric: bool) -> None:
-    if len(fig.axes) < 2:
+    if len(fig.axes) < 4:
         fig.clf()
-        ax_loss, ax_metric = fig.subplots(
-            2, 1, gridspec_kw={"height_ratios": [1.2, 1.0]})
-        fig.subplots_adjust(right=0.82, hspace=0.38, left=0.07,
+        ax_loss, ax_ppl, ax_lr, ax_metric = fig.subplots(
+            4, 1, gridspec_kw={"height_ratios": [1.5, 1.0, 1.0, 1.0]})
+        fig.subplots_adjust(right=0.82, hspace=0.45, left=0.07,
                             top=0.94, bottom=0.07)
     else:
-        ax_loss, ax_metric = fig.axes[:2]
+        ax_loss, ax_ppl, ax_lr, ax_metric = fig.axes[:4]
 
     _draw_loss_axis(ax_loss, runs, smooth_window, ema_alpha, raw_alpha,
                     forecast_window, forecast_enabled, forecast_use_smoothed,
                     show_raw_loss, show_ema_loss)
+    _draw_metric_axis(ax_ppl, runs, "perplexity", smooth_window, raw_alpha, show_raw_metric)
+    _draw_metric_axis(ax_lr, runs, "learning_rate", smooth_window, raw_alpha, show_raw_metric)
     _draw_metric_axis(ax_metric, runs, metric_name, smooth_window,
                       raw_alpha, show_raw_metric)
     fig.canvas.draw_idle()
@@ -479,9 +519,14 @@ def _render_figure(fig, runs: Sequence[RunSeries], metric_name: str,
 # ── file discovery ─────────────────────────────────────────────────────────────
 
 def _find_default_logs(log_dir: Path) -> List[Path]:
-    if not log_dir.exists():
-        return []
-    return sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime)
+    paths = []
+    if log_dir.exists():
+        paths = list(log_dir.glob("*.log")) + list(log_dir.glob("*.jsonl")) + list(log_dir.glob("*.csv"))
+    if str(log_dir).endswith("logs") or str(log_dir).endswith("logs\\"):
+        output_dir = log_dir.parent
+        if output_dir.exists():
+            paths += list(output_dir.glob("*.jsonl")) + list(output_dir.glob("*.csv"))
+    return sorted(paths, key=lambda p: p.stat().st_mtime)
 
 
 def _pick_logs_interactively(paths: List[Path]) -> List[Path]:

@@ -239,9 +239,12 @@ extern "C" {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= total_elements) return;
         
-        // Fast in-place Rectified Linear Activation for our FFN layer
-        float val = d_data[idx];
-        d_data[idx] = val > 0.0f ? val : 0.0f;
+        // Fast in-place GELU Activation for our FFN layer
+        float x = d_data[idx];
+        float x_cube = x * x * x;
+        float inner = 0.7978845608f * (x + 0.044715f * x_cube);
+        float tanh_inner = tanhf(inner);
+        d_data[idx] = 0.5f * x * (1.0f + tanh_inner);
     }
 }
 """

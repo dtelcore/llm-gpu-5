@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import re
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from core.loss import SoftmaxCrossEntropy
 from gpu_memory import install_global_memory_pool, get_memory_pool_stats_mb, free_held_pool_blocks
 from training_metrics import TrainingMetrics, validate_model_config, estimate_vram_usage
 import numpy as np
+from scheduler import CosineWarmupScheduler
 
 
 PARAMETER_PRESET_ASSUMED_VOCAB = 156
@@ -1198,6 +1200,18 @@ class InteractiveTrainer:
                     f"[OK] Shared tokenizer vocab built from {len(tokenizer_docs):,} documents ({tokenizer_source})"
                 )
             logger.info(f"[OK] Vocab size: {self.tokenizer.vocab_size}")
+            
+            from pathlib import Path
+            cp_path = Path(self.config['checkpoint_path'])
+            vocab_name = cp_path.name.replace('.npz', '.json')
+            if vocab_name.startswith('training_'):
+                vocab_name = vocab_name.replace('training_', 'vocab_', 1)
+            elif vocab_name.startswith('gpt_'):
+                vocab_name = vocab_name.replace('gpt_', 'vocab_', 1)
+            else:
+                vocab_name = "vocab_" + vocab_name
+            self.tokenizer.save_vocab(str(cp_path.parent / vocab_name))
+
             actual_params = estimate_model_params(
                 self.tokenizer.vocab_size,
                 T,
@@ -1275,6 +1289,9 @@ class InteractiveTrainer:
             # Initialize metrics tracking (report every 1 step)
             metrics = TrainingMetrics(total_steps, log_interval=1, backend="cuda")
             metrics.start()
+            
+            scheduler = CosineWarmupScheduler(max_lr=lr, total_steps=total_steps, warmup_steps=min(200, total_steps // 10))
+            
             grad_accum = self.config.get('grad_accum', 1)
             batch_tokens = B * T * grad_accum
             
@@ -1340,7 +1357,8 @@ class InteractiveTrainer:
                     grad_norm = self.model.compute_grad_norm()
                 
                 # Optimize (gradient clipping disabled - testing gradient flow)
-                self.model.update_weights(lr=lr, step=step)
+                current_lr = scheduler.get_lr(step)
+                self.model.update_weights(lr=current_lr, step=step)
                 pool_used_mb, pool_total_mb = get_memory_pool_stats_mb()
 
                 val_loss = None
@@ -1366,13 +1384,20 @@ class InteractiveTrainer:
                 # Record step metrics
                 metrics.step_end(
                     loss_val,
-                    lr=lr,
+                    lr=current_lr,
                     grad_norm=grad_norm,
                     batch_tokens=batch_tokens,
                     pool_used_mb=pool_used_mb,
                     pool_total_mb=pool_total_mb,
                     val_loss=val_loss,
                 )
+                
+                if step % 1000 == 0:
+                    try:
+                        subprocess.Popen([sys.executable, "training_log_plotter.py", "--save", "output/training_metrics_latest.png", "--no-forecast"])
+                        subprocess.Popen([sys.executable, "loss_landscape_plotter.py"])
+                    except Exception:
+                        pass
 
                 current_step = step
                 if current_step in probe_milestones:
@@ -1392,6 +1417,11 @@ class InteractiveTrainer:
             
             # Finalize metrics
             metrics.finalize()
+            try:
+                subprocess.Popen([sys.executable, "training_log_plotter.py", "--save", "output/training_metrics_latest.png", "--no-forecast"])
+                subprocess.Popen([sys.executable, "loss_landscape_plotter.py"])
+            except Exception:
+                pass
             if metrics.losses:
                 self.config['stage1_avg_loss'] = float(np.mean(metrics.losses))
             handoff_report = self._build_stage2_handoff_report()

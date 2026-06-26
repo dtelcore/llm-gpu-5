@@ -389,7 +389,28 @@ def build_generation_model(tokenizer, checkpoint_path, num_heads=None):
 
 
 def build_tokenizer_for_checkpoint(checkpoint_path, expected_vocab_size, source_docs=None, dataset_path=None):
-    """Build the shared tokenizer using the specified dataset."""
+    """Build the shared tokenizer using the specified dataset, prioritizing static vocabulary."""
+    from pathlib import Path
+    cp_path = Path(checkpoint_path)
+    vocab_name = cp_path.name.replace('.best.npz', '.json').replace('.npz', '.json')
+    if vocab_name.startswith('training_'):
+        vocab_name = vocab_name.replace('training_', 'vocab_', 1)
+    elif vocab_name.startswith('gpt_'):
+        vocab_name = vocab_name.replace('gpt_', 'vocab_', 1)
+    else:
+        vocab_name = "vocab_" + vocab_name
+        
+    vocab_path = cp_path.parent / vocab_name
+    if vocab_path.exists():
+        tokenizer = CharacterGPTTokenizer.load_vocab(str(vocab_path))
+        if tokenizer.vocab_size == expected_vocab_size:
+            return tokenizer
+        else:
+            logger.warning(f"[WARN] Static vocab at {vocab_path} size ({tokenizer.vocab_size}) != expected ({expected_vocab_size})")
+    else:
+        logger.warning(f"[WARNING] Static vocab file not found at {vocab_path}!")
+        logger.info("[INFO] Falling back to legacy corpus fitting (Expect scrambled outputs)...")
+
     run_config = load_matching_run_config(checkpoint_path)
     
     # Priority: 1. CLI explicit argument, 2. Config file 'dataset', 3. Global default

@@ -221,3 +221,42 @@ class CharacterGPTTokenizer:
             encode_logs=combined_encode_logs,
             decode_logs=combined_decode_logs,
         )
+
+    def save_vocab(self, filepath: str) -> None:
+        """Export token mappings and metadata to JSON."""
+        import json
+        from pathlib import Path
+        payload = {
+            "vocab_size": getattr(self, "vocab_size", len(self.uchars)),
+            "uchars": self.uchars,
+            "char_to_id": self.char_to_id,
+            "id_to_token": self.id_to_token
+        }
+        filepath_obj = Path(filepath)
+        filepath_obj.parent.mkdir(parents=True, exist_ok=True)
+        with open(filepath_obj, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] Tokenizer state frozen and saved to {filepath_obj}")
+
+    @classmethod
+    def load_vocab(cls, filepath: str) -> "CharacterGPTTokenizer":
+        """Instantiate tokenizer directly from a saved JSON state."""
+        import json
+        with open(filepath, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+            
+        instance = cls.__new__(cls)
+        
+        instance.uchars = payload["uchars"]
+        instance.char_to_id = payload["char_to_id"]
+        instance.id_to_token = {int(k): v for k, v in payload["id_to_token"].items()}
+        instance.vocab_size = payload["vocab_size"]
+        
+        instance.BYTE_FALLBACK_WINDOW = 256
+        instance.byte_offset = len(instance.uchars)
+        instance.byte_token_ids = set(range(instance.byte_offset, instance.byte_offset + instance.BYTE_FALLBACK_WINDOW))
+        instance.BOS_ID = instance.byte_offset + instance.BYTE_FALLBACK_WINDOW
+        instance.PAD_ID = instance.BOS_ID
+        
+        print(f"[INFO] Tokenizer successfully hydrated from static map: {filepath}")
+        return instance

@@ -27,8 +27,8 @@ import pycuda.driver as cuda
 from logging_config import logger
 from core.ops import (
     EmbeddingLookup, ElementwiseAdd, LayerNorm, MatMul2D, 
-    MatmulStrided, CausalSoftmax, Activation, Dropout, 
-    ReLUBackward, MatMulBackwardWeights, LayerNormBackward, AdamW
+    MatmulStrided, CausalSoftmax, GELU, Dropout, 
+    MatMulBackwardWeights, LayerNormBackward, AdamW
 )
 
 
@@ -297,12 +297,12 @@ class FeedForward:
         self.c_proj_b = Parameter((C,), init_scale=0.0)
         
         self.matmul_op = MatMul2D()
-        self.act_op = Activation()
-        self.relu_bwd_op = ReLUBackward()
+        self.act_op = GELU()
         self.weight_bwd_op = MatMulBackwardWeights()
 
         # Cache variables to hold forward activations for backward gradient computation
         self.cache_input = None
+        self.cache_pre_act = None
         self.cache_activated = None
         self.training = True
 
@@ -328,7 +328,11 @@ class FeedForward:
         # Layer 1: Expand to hidden dimension channel size
         gpu_hidden = self.matmul_op(gpu_input, self.c_fc_w.gpu_weights, self.c_fc_b.gpu_weights, M, N, K)
         
-        # Layer 2: In-place Rectified Linear Activation
+        if getattr(self, 'training', True):
+            self.cache_pre_act = np.empty((M, N), dtype=np.float32)
+            cuda.memcpy_dtoh(self.cache_pre_act, gpu_hidden)
+            
+        # Layer 2: In-place GELU Activation
         self.act_op(gpu_hidden, M * N)
         if getattr(self, 'training', True):
             self.cache_activated = gpu_hidden
@@ -350,7 +354,7 @@ class FeedForward:
         Returns:
             gpu_dIn: Downstream gradient [B*T, C] (float32)
         """
-        if self.cache_input is None or self.cache_activated is None:
+        if self.cache_input is None or self.cache_activated is None or self.cache_pre_act is None:
             raise RuntimeError("FeedForward.backward() called without forward caches")
 
         M = B * T
@@ -372,7 +376,16 @@ class FeedForward:
         host_dProjB = np.sum(host_dOut, axis=0)
 
         host_dHidden = host_dOut @ host_c_proj_w.T
-        host_dHidden[host_activated <= 0.0] = 0.0
+        
+        x = self.cache_pre_act
+        y = x + 0.044715 * (x ** 3)
+        z = 0.7978845608 * y
+        tanh_z = np.tanh(z)
+        sech2_z = 1.0 - (tanh_z ** 2)
+        dz_dx = 0.7978845608 * (1.0 + 0.134145 * (x ** 2))
+        grad = 0.5 * (1.0 + tanh_z) + 0.5 * x * sech2_z * dz_dx
+        
+        host_dHidden *= grad
 
         host_dFcW = host_input.T @ host_dHidden
         host_dFcB = np.sum(host_dHidden, axis=0)
@@ -395,6 +408,7 @@ class FeedForward:
         if self.cache_input is not None:
             self.cache_input.free()
             self.cache_input = None
+        self.cache_pre_act = None
 
 
 
@@ -440,12 +454,6 @@ class MultiHeadAttention:
         self.strided_matmul_op = MatmulStrided()
         self.softmax_op = CausalSoftmax()
         self.add_op = ElementwiseAdd()
-        self.identity_fallback = config.attention_impl == "identity"
-
-        if not MultiHeadAttention._fallback_warned:
-            if self.identity_fallback:
-                logger.warning("[WARN] GT730-safe attention fallback is active: attention weights are frozen and attention runs as an identity residual path.")
-                MultiHeadAttention._fallback_warned = True
         
         # Cache intermediates for backward pass
         self.cache_input = None
@@ -478,11 +486,6 @@ class MultiHeadAttention:
         self.cache_v = None
         self.cache_attn_weights = None
         self.cache_context = None
-
-        if self.identity_fallback:
-            gpu_output = cuda.mem_alloc(M * C * 4)
-            cuda.memcpy_dtod(gpu_output, gpu_input, M * C * 4)
-            return gpu_output
 
         host_input = np.empty((M, C), dtype=np.float32)
         cuda.memcpy_dtoh(host_input, gpu_input)
@@ -578,11 +581,6 @@ class MultiHeadAttention:
         C = self.config.embedding_dim
         NH = self.config.num_heads
         HD = self.config.head_dim
-
-        if self.identity_fallback:
-            gpu_dIn = cuda.mem_alloc(M * C * 4)
-            cuda.memcpy_dtod(gpu_dIn, gpu_dOut, M * C * 4)
-            return gpu_dIn
 
         if any(cache is None for cache in [self.cache_input, self.cache_q, self.cache_k, self.cache_v, self.cache_attn_weights, self.cache_context]):
             raise RuntimeError("MultiHeadAttention.backward() called without forward caches")

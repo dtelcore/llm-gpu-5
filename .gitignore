@@ -12,7 +12,7 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
-data/
+data/   
 
 # Virtual environments
 .venv/

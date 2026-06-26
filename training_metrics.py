@@ -1,6 +1,9 @@
 """Training metrics tracking and logging."""
 
 import time
+import json
+import csv
+import os
 import numpy as np
 from datetime import datetime, timedelta
 from logging_config import logger
@@ -12,10 +15,12 @@ from gpu_memory import get_memory_pool_stats_mb
 class TrainingMetrics:
     """Track and log training metrics in real-time."""
     
-    def __init__(self, total_steps, log_interval=1, backend="cuda"):
+    def __init__(self, total_steps, log_interval=1, backend="cuda", log_prefix="output/training_metrics_latest"):
         self.total_steps = total_steps
         self.log_interval = log_interval
         self.backend = backend
+        self.csv_path = f"{log_prefix}.csv"
+        self.jsonl_path = f"{log_prefix}.jsonl"
         
         self.step = 0
         self.start_time = None
@@ -44,6 +49,15 @@ class TrainingMetrics:
         # Get initial GPU memory
         self.initial_free_mem, self.initial_total_mem = cuda.mem_get_info()
         logger.info(f"GPU Memory: {self.initial_total_mem / 1024**2:.0f}MB total, {self.initial_free_mem / 1024**2:.0f}MB free")
+        
+        # Initialize telemetry files
+        os.makedirs(os.path.dirname(self.csv_path) or ".", exist_ok=True)
+        with open(self.csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step", "loss", "perplexity", "learning_rate", "tokens_per_sec", "grad_norm", "vram_mb"])
+            
+        with open(self.jsonl_path, "w") as f:
+            pass  # Create empty file
     
     def step_start(self):
         """Mark start of a training step."""
@@ -68,6 +82,28 @@ class TrainingMetrics:
         self.perplexities.append(perplexity)
         
         self.step += 1
+        
+        # Calculate tokens_per_sec for telemetry
+        tokens_per_sec = 0.0
+        if batch_tokens and step_time > 0:
+            tokens_per_sec = batch_tokens / step_time
+            
+        # Write telemetry
+        with open(self.csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([self.step, loss_value, perplexity, lr, tokens_per_sec, grad_norm, pool_used_mb])
+            
+        with open(self.jsonl_path, "a") as f:
+            json.dump({
+                "step": self.step,
+                "loss": loss_value,
+                "perplexity": perplexity,
+                "learning_rate": lr,
+                "tokens_per_sec": tokens_per_sec,
+                "grad_norm": grad_norm,
+                "vram_mb": pool_used_mb
+            }, f)
+            f.write("\n")
         
         # Log if interval reached
         if self.should_log_step(self.step):
