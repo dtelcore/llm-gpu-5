@@ -33,6 +33,17 @@ from gpu_memory import install_global_memory_pool, get_memory_pool_stats_mb, fre
 from training_metrics import TrainingMetrics, validate_model_config, estimate_vram_usage
 import numpy as np
 from scheduler import CosineWarmupScheduler
+from regime_monitor import (
+    RegimeController,
+    RegimeTracker,
+    RegimeSample,
+    compute_boundary_integrity_score,
+    compute_phase_transition_score,
+    compute_repetition_collapse_index,
+    classify_regime,
+    lightweight_greedy_probe,
+    token_repetition_stats,
+)
 
 
 PARAMETER_PRESET_ASSUMED_VOCAB = 156
@@ -154,6 +165,12 @@ STAGE2_MILESTONE_DIP_TOLERANCE = 0.05
 DEFAULT_CORPUS_LIMIT = 5000
 VAL_RESAMPLE_INTERVAL_STEPS = 25
 
+# --- Regime Controller (BIS/TTR/RCI/Phi telemetry, see regime_monitor.py) ---
+REGIME_PROBE_INTERVAL_STEPS = 100
+REGIME_PROBE_MAX_TOKENS = 40
+REGIME_MIN_STEP = 50
+REGIME_PROBE_PROMPT = PROBE_PROMPT
+
 
 def estimate_model_params(vocab_size, max_len, embedding_dim, num_layers):
     """Estimate parameter count using the repo's GPT architecture layout."""
@@ -269,6 +286,95 @@ class InteractiveTrainer:
         self.config['best_goal_score'] = None
         self.config['goal_ema_train_loss'] = None
         self.config['goal_ema_val_loss'] = None
+
+    def _reset_regime_tracking(self):
+        """Initialize Regime Controller (BIS/TTR/RCI/Phi) state for the current run."""
+        self.config.setdefault('label_smoothing', 0.1)
+        self.config['lr_regime_multiplier'] = 1.0
+        self.config['recommended_next_embedding_dim'] = None
+        self.config['regime_history'] = []
+        self._regime_tracker = RegimeTracker()
+        self._regime_controller = RegimeController(min_step=REGIME_MIN_STEP)
+        self._regime_jsonl_path = "output/regime_metrics_latest.jsonl"
+        os.makedirs(os.path.dirname(self._regime_jsonl_path), exist_ok=True)
+        with open(self._regime_jsonl_path, "w") as f:
+            pass  # truncate/create for this run
+
+    def _run_regime_probe_and_apply(self, step):
+        """Run a lightweight in-process probe, update BIS/TTR/RCI/Phi telemetry,
+        consult the Regime Controller, and apply any bounded/safe actions it
+        returns. Never mutates architecture live -- only label_smoothing,
+        lr_regime_multiplier, and a next-run embedding_dim recommendation."""
+        try:
+            probe_text = lightweight_greedy_probe(
+                self.model, self.tokenizer, REGIME_PROBE_PROMPT, REGIME_PROBE_MAX_TOKENS
+            )
+        except Exception as exc:
+            logger.warning(f"[REGIME] Probe failed at step {step}, skipping this cycle: {exc}")
+            return
+
+        stats = token_repetition_stats(probe_text)
+        bis = compute_boundary_integrity_score(probe_text)
+        ttr = stats['token_unique_ratio']
+        rci = compute_repetition_collapse_index(stats)
+        phi = compute_phase_transition_score(bis, ttr, rci)
+        regime = classify_regime(phi)
+
+        previous_regime = self._regime_tracker.previous_regime
+        sample = RegimeSample(step=step, bis=bis, ttr=ttr, rci=rci, phi=phi, regime=regime)
+        ema_phi, trend = self._regime_tracker.update(sample)
+
+        actions = self._regime_controller.decide(
+            sample, ema_phi, trend,
+            current_label_smoothing=self.config.get('label_smoothing', 0.1),
+            current_lr_multiplier=self.config.get('lr_regime_multiplier', 1.0),
+            previous_regime=previous_regime,
+        )
+
+        action_summaries = []
+        for action in actions:
+            action_summaries.append(action.action_type)
+            if action.action_type == "EMBEDDING_EXPANSION_RECOMMENDED":
+                current_embed = self.config.get('embedding_dim', 64)
+                self.config['recommended_next_embedding_dim'] = int(current_embed * 2)
+                logger.warning(f"[REGIME] {action.reason} -- recommending embedding_dim "
+                                f"{current_embed} -> {self.config['recommended_next_embedding_dim']} for the NEXT run "
+                                f"(architecture cannot change mid-run)")
+            elif action.action_type == "INCREASE_LABEL_SMOOTHING":
+                self.config['label_smoothing'] = action.payload['new_label_smoothing']
+                logger.warning(f"[REGIME] {action.reason} -- label_smoothing -> "
+                                f"{self.config['label_smoothing']:.3f}")
+            elif action.action_type == "DECAY_LEARNING_RATE":
+                self.config['lr_regime_multiplier'] = action.payload['new_lr_multiplier']
+                logger.info(f"[REGIME] {action.reason} -- lr_regime_multiplier -> "
+                            f"{self.config['lr_regime_multiplier']:.3f}")
+            elif action.action_type == "SAVE_AWAKENING_CHECKPOINT":
+                logger.info(f"[REGIME] {action.reason} -- saving awakening checkpoint")
+                checkpoint_root, checkpoint_ext = os.path.splitext(self.config['checkpoint_path'])
+                awakening_path = f"{checkpoint_root}.awakening.step{step}{checkpoint_ext}"
+                try:
+                    self._save_checkpoint_with_probes(awakening_path, f"AWAKENING_step{step}")
+                except Exception as exc:
+                    logger.warning(f"[REGIME] Failed to save awakening checkpoint: {exc}")
+
+        logger.info(
+            f"[REGIME] step={step} bis={bis:.3f} ttr={ttr:.3f} rci={rci:.3f} phi={phi:.3f} "
+            f"regime={regime} ema_phi={ema_phi:.3f} trend={trend} "
+            f"actions={','.join(action_summaries) if action_summaries else 'none'}"
+        )
+
+        record = {
+            "step": step, "bis": bis, "ttr": ttr, "rci": rci, "phi": phi,
+            "regime": regime, "ema_phi": ema_phi, "trend": trend,
+            "actions": action_summaries, "probe_text": probe_text,
+        }
+        self.config['regime_history'].append(record)
+        try:
+            with open(self._regime_jsonl_path, "a") as f:
+                json.dump(record, f)
+                f.write("\n")
+        except Exception as exc:
+            logger.warning(f"[REGIME] Failed to write regime telemetry: {exc}")
 
     def _update_goal_stability_score(self, train_loss, val_loss=None):
         """Update EMA-smoothed losses and return a stability score for goal checkpointing."""
@@ -422,28 +528,13 @@ class InteractiveTrainer:
         return max_run
 
     def _token_repetition_stats(self, text):
-        """Return repetition stats for tokenized text."""
-        tokens = [tok for tok in re.findall(r"\w+|[^\w\s]", text.lower()) if tok.strip()]
-        token_count = len(tokens)
-        if token_count < 2:
-            return {
-                'dominant_ratio': 0.0,
-                'immediate_repeat_ratio': 0.0,
-                'token_unique_ratio': 1.0 if token_count == 1 else 0.0,
-            }
+        """Return repetition stats for tokenized text.
 
-        counts = {}
-        for token in tokens:
-            counts[token] = counts.get(token, 0) + 1
-        dominant_ratio = max(counts.values()) / token_count
-        immediate_repeats = sum(1 for idx in range(1, token_count) if tokens[idx] == tokens[idx - 1])
-        immediate_repeat_ratio = immediate_repeats / max(1, token_count - 1)
-        token_unique_ratio = len(counts) / token_count
-        return {
-            'dominant_ratio': dominant_ratio,
-            'immediate_repeat_ratio': immediate_repeat_ratio,
-            'token_unique_ratio': token_unique_ratio,
-        }
+        Thin wrapper around regime_monitor.token_repetition_stats so the
+        readability heuristic below and the Regime Controller's TTR/RCI math
+        share one implementation instead of two copies drifting apart.
+        """
+        return token_repetition_stats(text)
 
     def _score_text_readability(self, text, prompt):
         """Heuristic readability score for probe text, normalized to [0, 1]."""
@@ -624,7 +715,9 @@ class InteractiveTrainer:
                 corpus_limit=self.config.get('corpus_size', 3000000),
                 name=self.config.get('name', 'gpt_model'),
                 preset_name=self.config.get('preset_name', 'custom'),
-                init_checkpoint_path=self.config.get('init_checkpoint_path', None)
+                init_checkpoint_path=self.config.get('init_checkpoint_path', None),
+                label_smoothing=self.config.get('label_smoothing', 0.1),
+                recommended_next_embedding_dim=self.config.get('recommended_next_embedding_dim', None),
             )
             rc.save(self.CONFIG_FILE)
             logger.info(f"[OK] Saved run config to {self.CONFIG_FILE}")
@@ -738,6 +831,8 @@ class InteractiveTrainer:
                     'total_steps': rc.total_steps,
                     'learning_rate': rc.learning_rate,
                     'attention_impl': rc.attention_impl,
+                    'label_smoothing': rc.label_smoothing,
+                    'recommended_next_embedding_dim': rc.recommended_next_embedding_dim,
                     'log_name': f"training_{rc.total_steps}steps",
                     'checkpoint_name': f"{rc.name}_checkpoint",
                     'checkpoint_path': f"output/checkpoints/{rc.name}_checkpoint.npz",
@@ -866,6 +961,16 @@ class InteractiveTrainer:
         print("\n" + "="*73)
         print("STEP 2: MODEL ARCHITECTURE")
         print("="*73)
+
+        recommended_embed = self.config.get('recommended_next_embedding_dim')
+        if recommended_embed is None and os.path.exists(self.CONFIG_FILE):
+            try:
+                recommended_embed = RunConfig.load(self.CONFIG_FILE).recommended_next_embedding_dim
+            except Exception:
+                recommended_embed = None
+        if recommended_embed:
+            print(f"\n[REGIME HINT] The previous run's Regime Controller detected boundary "
+                  f"collapse and recommended embedding_dim >= {recommended_embed} for this run.")
 
         # Load presets with categories
         presets_path = os.path.join(os.path.dirname(__file__), "config", "presets_gt730_v2.json")
@@ -1343,6 +1448,7 @@ class InteractiveTrainer:
         init_checkpoint_path = self.config.get('init_checkpoint_path')
         self._reset_goal_tracking()
         self._reset_stage_handoff_tracking()
+        self._reset_regime_tracking()
         
         try:
             train_corpus, val_corpus = split_corpus_for_validation(corpus)
@@ -1491,7 +1597,10 @@ class InteractiveTrainer:
                     gpu_logits = self.model.forward(gpu_input, B, T)
                     
                     # Loss & backward
-                    micro_loss, gpu_dLogits = criterion(gpu_logits, gpu_target, N, V)
+                    micro_loss, gpu_dLogits = criterion(
+                        gpu_logits, gpu_target, N, V,
+                        label_smoothing=self.config.get('label_smoothing', 0.1),
+                    )
                     gpu_logits.free()
                     
                     # CRITICAL: Detect NaN/Inf loss and stop training
@@ -1526,9 +1635,12 @@ class InteractiveTrainer:
                     grad_norm = self.model.compute_grad_norm()
                 
                 # Optimize (gradient clipping disabled - testing gradient flow)
-                current_lr = scheduler.get_lr(step)
+                current_lr = scheduler.get_lr(step) * self.config.get('lr_regime_multiplier', 1.0)
                 self.model.update_weights(lr=current_lr, step=step)
                 pool_used_mb, pool_total_mb = get_memory_pool_stats_mb()
+
+                if step >= REGIME_MIN_STEP and step % REGIME_PROBE_INTERVAL_STEPS == 0:
+                    self._run_regime_probe_and_apply(step)
 
                 val_loss = None
                 if metrics.should_log_step(step):
@@ -1543,7 +1655,10 @@ class InteractiveTrainer:
                         cuda.memcpy_htod(gpu_val_target, val_target_tokens.astype(np.int32))
 
                     val_logits = self.model.forward(gpu_val_input, val_batch_size, T)
-                    val_loss, gpu_val_dLogits = criterion(val_logits, gpu_val_target, val_batch_size * T, V)
+                    val_loss, gpu_val_dLogits = criterion(
+                        val_logits, gpu_val_target, val_batch_size * T, V,
+                        label_smoothing=self.config.get('label_smoothing', 0.1),
+                    )
                     val_logits.free()
                     gpu_val_dLogits.free()
                     self.model.free_forward_caches()
@@ -1833,6 +1948,23 @@ class InteractiveTrainer:
         story_bad_samples_text = "unknown" if story_bad_samples is None else str(story_bad_samples)
         print(f"  story bad_samples:          {story_bad_samples_text} (must be 0)")
         print(f"  Ready for Stage 2:          {'YES' if handoff_report['ready'] else 'NO'}")
+
+        regime_history = self.config.get('regime_history') or []
+        if regime_history:
+            last_sample = regime_history[-1]
+            print(f"\nRegime Controller Summary:")
+            print(f"  Final regime:               {last_sample['regime']} (Phi={last_sample['phi']:.3f}, ema_phi={last_sample['ema_phi']:.3f})")
+            print(f"  Final BIS / TTR / RCI:      {last_sample['bis']:.3f} / {last_sample['ttr']:.3f} / {last_sample['rci']:.3f}")
+            print(f"  label_smoothing (final):    {self.config.get('label_smoothing', 0.1):.3f}")
+            print(f"  lr_regime_multiplier:       {self.config.get('lr_regime_multiplier', 1.0):.3f}")
+            triggered_types = sorted({a for sample in regime_history for a in sample.get('actions', [])})
+            print(f"  Actions triggered this run: {', '.join(triggered_types) if triggered_types else 'none'}")
+            print(f"  Full telemetry:             {getattr(self, '_regime_jsonl_path', 'output/regime_metrics_latest.jsonl')}")
+            if self.config.get('recommended_next_embedding_dim'):
+                print(f"\n  [RECOMMENDATION] Boundary collapse was detected during this run.")
+                print(f"  Next run: consider raising embedding_dim "
+                      f"{self.config.get('embedding_dim')} -> {self.config['recommended_next_embedding_dim']} "
+                      f"(saved to {self.CONFIG_FILE}; architecture cannot change mid-run).")
 
         print(f"\nNext steps:")
         print(f"  - Test generation: python generate.py --checkpoint {self._preferred_checkpoint_path()}")

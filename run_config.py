@@ -30,6 +30,12 @@ class RunConfig:
     # Regularization
     label_smoothing: float = 0.1
 
+    # Regime Controller hint (informational only -- never applied automatically;
+    # the next AutoTrain model-config prompt may surface this as a suggestion).
+    # Architecture (embedding_dim/num_heads/num_layers) cannot change mid-run, so
+    # this field only ever round-trips a recommendation for the *next* run.
+    recommended_next_embedding_dim: int = None
+
     # Validation cadence (decoupled from logging interval)
     val_interval: int = 100
     
