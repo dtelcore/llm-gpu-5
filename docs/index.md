@@ -1,8 +1,8 @@
 ﻿# Documentation Index
 
-Last updated: 2026-05-24
+Last updated: 2026-06-30
 
-Current state: the training and generation flow now uses sampled batch windows, newline-preserving corpus loading, and shared generation probes for tokenizer roundtrip, greedy decode, memorization-prefix, and first-step logits checks.
+Current state: GPU-resident FeedForward backward and Phase 3 Multi-Head Attention CUDA kernels (`core/mha_kernels.py`, `core/mha_ops.py`) have landed behind a three-layer NumPy golden-model correctness gate (`test_mha_golden_model.py`). Training/generation flow still uses sampled batch windows, newline-preserving corpus loading, and shared generation probes for tokenizer roundtrip, greedy decode, memorization-prefix, and first-step logits checks. Tokenizer/corpus building now reports live `tqdm` progress.
 
 ## Start here
 
@@ -23,3 +23,5 @@ Current state: the training and generation flow now uses sampled batch windows, 
 - Progress and history: changelog.md, stepchangelog.md
 - Current backlog: todo.md, todos-all.md
 - Completion snapshot: PROJECT_COMPLETION.md
+- GPU kernel internals: ARCHITECTURE_GUIDE.md (FFN backward, MHA kernels, golden-model test harnesses)
+- Publishing changes: `gitpush.py` (repo root) runs status -> add -> commit -> push to `origin/main`

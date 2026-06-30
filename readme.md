@@ -50,6 +50,15 @@ python .\training_log_plotter.py --select
 python .\training_log_plotter.py --select --no-show --export-csv output/logs/metrics_export.csv
 ```
 
+### Publishing Changes
+
+`gitpush.py` runs the repo's standard status -> add -> commit -> push sequence against `origin/main` in one step (PowerShell-safe; no `&&`/heredoc quoting issues):
+
+```powershell
+python .\gitpush.py "your commit message"
+python .\gitpush.py    # no args: shows pending files and prompts for a message
+```
+
 If tokenizer behavior changes, clear cache before the next run:
 
 ```powershell

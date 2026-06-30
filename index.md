@@ -2,7 +2,16 @@
 
 This is the canonical starting point for the current state of the project.
 
-## Latest Snapshot (2026-05-24)
+## Latest Snapshot (2026-06-30)
+
+- Added GPU-resident FeedForward backward pass (`core/ops.py`), removing the CPU/NumPy round-trip from FFN gradients.
+- Added Phase 3 Multi-Head Attention CUDA kernels (`core/mha_kernels.py`) and an orchestration layer (`core/mha_ops.py: MHAController`) with fused QKV projection.
+- Added a three-layer MHA correctness gate (`test_mha_golden_model.py`): kernel-level parity, fused-QKV representation equivalence, and controller execution-path parity, each against an independent NumPy reference.
+- Added an FFN backward parity/timing harness (`test_ffn_gpu_backward.py`).
+- Added `tqdm` progress bars to tokenizer building and corpus file loading so large multi-million-document runs no longer appear frozen.
+- Added `gitpush.py`: a one-shot status -> add -> commit -> push helper for publishing changes to `origin/main`.
+
+## Previous Snapshot (2026-05-24)
 
 - Data path repaired and newline-safe corpus normalization is active.
 - Training uses sampled windows plus held-out validation metrics.

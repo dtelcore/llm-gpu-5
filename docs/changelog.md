@@ -1,5 +1,16 @@
 ﻿# Changelog
 
+## 2026-06-30
+
+- Added GPU-resident FeedForward backward pass (`core/ops.py`: `GELUBackward`, `ReduceSumAxis0`, `MatMulBackwardInput`), removing the CPU/NumPy round-trip from the FFN gradient path. Legacy CPU backward kept as a togglable oracle (`use_cpu_backward`) for parity verification via `test_ffn_gpu_backward.py`.
+- Added Phase 3 Multi-Head Attention CUDA kernels (`core/mha_kernels.py`): causal score matmul, fused causal softmax forward/backward (VJP form), projection-space `dQ`/`dK`/`dV` gradient kernels, a fused QKV projection kernel, and a split kernel that materializes contiguous Q/K/V tensors out of the fused buffer.
+- Added `core/mha_ops.py` (`MHAController`): the production orchestration layer wiring fused QKV projection -> split -> causal attention scores -> fused softmax -> output projection into a single `forward()` call.
+- Added `test_mha_golden_model.py`: a three-layer correctness gate -- (1) kernel-level parity against an independent NumPy reference, (2) fused-QKV representation equivalence against a NumPy triple-projection reference, (3) controller execution-path parity (hand-assembled kernel sequence vs. `MHAController.forward()`) -- required to pass before any tiling/fusion optimization work.
+- Added a cosine warmup learning-rate scheduler and centralized GPU kernel compilation into a single shared `SourceModule` pass.
+- Added `tqdm` progress bars to the tokenizer build path (`tokenizer/hybrid_tokenizer.py`) and corpus file loading (`corpus_utils.py`).
+- Added `gpu_timing.py` for lightweight step-level GPU timing instrumentation.
+- Added `gitpush.py`: a status -> add -> commit -> push helper for `origin/main`.
+
 ## 2026-05-24
 
 - Added reusable generation probes for tokenizer roundtrip, greedy decode, memorization-prefix, and first-step logits.
