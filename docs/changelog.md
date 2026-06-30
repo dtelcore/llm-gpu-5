@@ -1,5 +1,16 @@
 ﻿# Changelog
 
+## 2026-07-01
+
+- **Phase 2C fused attention:** merged QKt + causal softmax + PV into `fused_attention_forward_kernel`; wired into `MHAController.forward()` and production `MultiHeadAttention` in `model/gpt.py`. Layer 6 parity test in `test_mha_golden_model.py`.
+- **MHA integration:** GPU-resident forward with `split_heads_kernel` / `merge_heads_kernel`; integration oracle in `test_mha_integration_parity.py`; smoke test `smoke_train_mha_integration.py`.
+- **Label smoothing:** `RunConfig.label_smoothing` (default 0.1); fused loss kernel in `core/loss.py`; threaded through `auto_train.py` and `train.py`; tests in `test_label_smoothing_loss.py`.
+- **Embedding scale fix:** `small` preset and `last_run_config.json` bumped to `embedding_dim=64` for 4096-token vocab boundary stability.
+- **Regime Controller:** `regime_monitor.py` (BIS/TTR/RCI/Phi + bounded controller); wired into `auto_train.py` train loop; telemetry in `output/regime_metrics_latest.jsonl`; docs in `docs/REGIME_CONTROLLER.md`.
+- **AutoTrain cost cards:** per-preset VRAM/tok/s/collapse-risk estimates in model selection menu.
+- **Trajectory scoring:** `regime_policy_optimizer.py` + `test_regime_policy_optimizer.py` for offline policy evaluation.
+- **Docs refresh:** updated index, workflow, architecture, quick reference, logging guides for all of the above.
+
 ## 2026-06-30
 
 - Added GPU-resident FeedForward backward pass (`core/ops.py`: `GELUBackward`, `ReduceSumAxis0`, `MatMulBackwardInput`), removing the CPU/NumPy round-trip from the FFN gradient path. Legacy CPU backward kept as a togglable oracle (`use_cpu_backward`) for parity verification via `test_ffn_gpu_backward.py`.

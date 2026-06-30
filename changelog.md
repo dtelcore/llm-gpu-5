@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-07-01
+
+See [docs/changelog.md](docs/changelog.md) for the full entry: Phase 2C fused MHA, label smoothing, Regime Controller (BIS/Phi), AutoTrain cost cards, trajectory scoring, docs refresh.
+
 ## 2026-06-30
 
 - Added GPU-resident FeedForward backward pass (`core/ops.py`: `GELUBackward`, `ReduceSumAxis0`, `MatMulBackwardInput`), removing the CPU/NumPy round-trip from the FFN gradient path. Kept the legacy CPU backward as a togglable oracle (`use_cpu_backward`) for parity verification.

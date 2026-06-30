@@ -1,8 +1,8 @@
 ﻿# Quick Reference
 
-Last updated: 2026-05-24
+Last updated: 2026-07-01
 
-Current state: the fastest validation path is a fresh training run followed by the shared probe report. Use the same prompt and memorization prefix across checkpoints to compare quality consistently.
+Current state: use `auto_train.py` for interactive runs with Regime Controller probes. Score language-quality trajectories offline with `regime_policy_optimizer.py`.
 
 ## Environment
 
@@ -11,19 +11,39 @@ cd "C:\dev\llm gpu 5"
 .\venv\Scripts\Activate.ps1
 ```
 
-## Train (interactive)
+## Train (interactive, recommended)
 
 ```powershell
 python .\auto_train.py
 ```
 
-`auto_train.py` now auto-saves milestone checkpoints and runs probe diagnostics at 25%, 50%, 75%, and 100% of configured steps.
-Those probes now include both greedy decode and a fixed sampled decode using top-p sampling plus a mild repetition penalty.
+Features:
+- Preset cost cards (VRAM, tok/s, collapse risk)
+- Regime probes every 100 steps (BIS/Phi)
+- Label smoothing (default 0.1)
+- Milestone checkpoints + full probes at 25/50/75/100%
 
 ## Train (fixed defaults)
 
 ```powershell
 python .\train.py
+```
+
+Uses `output/last_run_config.json`. Label smoothing yes; Regime Controller no.
+
+## Score regime trajectory (offline)
+
+```powershell
+python .\regime_policy_optimizer.py output\regime_metrics_latest.jsonl
+```
+
+## Run tests (no training)
+
+```powershell
+python .\test_regime_monitor.py
+python .\test_regime_policy_optimizer.py
+python .\test_mha_golden_model.py
+python .\test_label_smoothing_loss.py
 ```
 
 ## Generate text
@@ -32,18 +52,12 @@ python .\train.py
 python .\generate.py --checkpoint output/checkpoints/gpt_model_latest.npz --prompt "cuda " --max_new_tokens 40 --temperature 0.6
 ```
 
-If you want the script to auto-pick the current best checkpoint from `output/last_run_config.json` or the newest `*.best.npz`, omit `--checkpoint`.
+Omit `--checkpoint` to auto-pick best from `output/last_run_config.json` or newest `*.best.npz`.
 
 ## Interactive model tester
 
 ```powershell
 python .\interactive_model_tester.py
-```
-
-Or pin a specific checkpoint explicitly:
-
-```powershell
-python .\interactive_model_tester.py --checkpoint output/checkpoints/gpt_500steps_1p5e-06lr_ctx128_20260524_191056.best.npz --max_new_tokens 60 --temperature 0.8
 ```
 
 ## View latest logs
@@ -54,6 +68,12 @@ $latest = Get-ChildItem output\logs\*.log | Sort-Object LastWriteTime -Descendin
 if ($latest) { Get-Content $latest.FullName -Tail 80 }
 ```
 
+Filter regime lines:
+
+```powershell
+Get-ChildItem output\logs\*.log | Select-String "\[REGIME\]"
+```
+
 ## List checkpoints
 
 ```powershell
@@ -62,10 +82,16 @@ Get-ChildItem output\checkpoints\*.npz | Sort-Object LastWriteTime -Descending
 
 ## Important defaults in code
 
-- Shared FineWeb path: data/fineweb_100mb.txt
-- Shared training corpus fallback: corpus_utils.TRAINING_CORPUS
-- Shared tokenizer cache dir: output/cache/tokenizer
-- generate.py default checkpoint: output/checkpoints/gpt_model_latest.npz
-- interactive_model_tester.py default checkpoint: best checkpoint from output/last_run_config.json, else newest *.best.npz
-- auto_train.py artifact names include model token (`<name>_<embedding>d_<layers>l`) in log/checkpoint filenames
-- Training now reports a held-out validation loss in the step logs
+- Shared FineWeb path: `data/fineweb_100mb.txt`
+- Shared tokenizer cache: `output/cache/tokenizer`
+- Run config: `output/last_run_config.json`
+- Regime telemetry: `output/regime_metrics_latest.jsonl`
+- Default `label_smoothing`: 0.1 (`RunConfig`)
+- Default `embedding_dim` (small preset): 64
+- Regime probe interval: every 100 steps after step 50 (`auto_train.py`)
+
+## Documentation
+
+- [docs/REGIME_CONTROLLER.md](REGIME_CONTROLLER.md) — BIS/TTR/RCI/Phi and controller actions
+- [docs/TRAINING_WORKFLOW.md](TRAINING_WORKFLOW.md) — full training pipeline
+- [docs/ARCHITECTURE_GUIDE.md](ARCHITECTURE_GUIDE.md) — module map and MHA path

@@ -1,5 +1,7 @@
 # GPT Model Upgrade Walkthrough
 
+> **Note (2026-07-01):** This walkthrough covers earlier GELU/scheduler/plotter work. For current architecture (GPU-resident MHA Phase 2C, Regime Controller, label smoothing), see [docs/ARCHITECTURE_GUIDE.md](docs/ARCHITECTURE_GUIDE.md) and [docs/REGIME_CONTROLLER.md](docs/REGIME_CONTROLLER.md).
+
 I have successfully completed the PyCUDA GPT model upgrades and integrated the new training telemetry components.
 
 > [!TIP]

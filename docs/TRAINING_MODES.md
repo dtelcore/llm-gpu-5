@@ -1,20 +1,16 @@
 ﻿# Training Modes
 
-Last updated: 2026-05-24
-
-Current state: the interactive and fixed trainers both use the repaired corpus path and now emit the shared probe diagnostics after checkpoint saves.
-Both trainers also report held-out validation loss, and the default context length is 128 when VRAM allows.
+Last updated: 2026-07-01
 
 ## 1) auto_train.py (recommended)
 
-Use when you want interactive control over:
-- Dataset
-- Model preset and dimensions
-- Learning rate, steps, sequence length
-- Optional init checkpoint compatibility/adoption
-- Optional generation after training
+Interactive control over dataset, model preset (with cost cards), hyperparameters, init checkpoint, and post-training generation.
 
-Command:
+**Includes:**
+- Regime Controller (BIS/Phi probes every 100 steps)
+- Label smoothing (adjustable by controller mid-run)
+- Preset collapse-risk hints
+- Milestone checkpoints + full generation probes
 
 ```powershell
 python .\auto_train.py
@@ -22,9 +18,7 @@ python .\auto_train.py
 
 ## 2) train.py (fixed in-script defaults)
 
-Use when you want a consistent non-interactive run path for repeatability.
-
-Command:
+Non-interactive repeatability. Loads `output/last_run_config.json`. Label smoothing yes; **no Regime Controller**.
 
 ```powershell
 python .\train.py
@@ -32,9 +26,7 @@ python .\train.py
 
 ## 3) pipeline.py (setup-oriented walkthrough)
 
-Use when you want a guided flow for configuration understanding and project orientation.
-
-Command:
+Guided flow for configuration understanding.
 
 ```powershell
 python .\pipeline.py
@@ -42,12 +34,18 @@ python .\pipeline.py
 
 ## 4) generate.py (inference)
 
-Use after a checkpoint exists.
-
-Command:
+After a checkpoint exists:
 
 ```powershell
 python .\generate.py --checkpoint output/checkpoints/<checkpoint>.npz --prompt "the" --max_new_tokens 40
 ```
 
-The generation path now supports greedy decoding, top-p sampling, and a mild repetition penalty so sampled probes can show whether distribution quality improved before greedy decode fully opens up.
+## 5) regime_policy_optimizer.py (offline analysis)
+
+Score a completed run's language-quality trajectory from JSONL:
+
+```powershell
+python .\regime_policy_optimizer.py output\regime_metrics_latest.jsonl
+```
+
+Not a training entry point — post-run analysis only.

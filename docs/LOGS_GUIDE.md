@@ -1,8 +1,8 @@
 ﻿# Logs Guide
 
-Last updated: 2026-05-24
+Last updated: 2026-07-01
 
-Current state: when comparing runs, inspect the saved probe output for tokenizer roundtrip, greedy decode, memorization-prefix, and first-step logits alongside the scalar metrics.
+When comparing runs, inspect scalar metrics, `[REGIME]` language-quality lines, milestone probe output, and offline trajectory scores.
 
 ## List recent logs
 
@@ -24,36 +24,45 @@ $latest = Get-ChildItem output\logs\*.log | Sort-Object LastWriteTime -Descendin
 if ($latest) { Get-Content $latest.FullName -Wait }
 ```
 
-## Filter by key fields
+## Filter training metrics
 
 ```powershell
 Get-ChildItem output\logs\*.log | Select-String "\[train\]\[cuda\]|loss=|ppl=|tok/s=|device_used_mb="
 ```
 
-## Interactive plotting (matplotlib)
+## Filter Regime Controller lines
 
-Install matplotlib once:
+```powershell
+Get-ChildItem output\logs\*.log | Select-String "\[REGIME\]"
+```
+
+## Inspect regime JSONL telemetry
+
+```powershell
+Get-Content output\regime_metrics_latest.jsonl
+python .\regime_policy_optimizer.py output\regime_metrics_latest.jsonl
+```
+
+## Interactive plotting (matplotlib)
 
 ```powershell
 python -m pip install matplotlib
-```
-
-Launch interactive selector (pick one or multiple logs):
-
-```powershell
 python .\training_log_plotter.py --select
 ```
 
-The plotter opens:
-- Top chart: train loss and validation loss
-- Bottom chart: switch metric with the radio controls (lr, tok/s, grad_norm, step_ms, device_used_mb, ppl)
+Top chart: train + validation loss. Bottom: lr, tok/s, grad_norm, step_ms, device_used_mb, ppl.
 
-## Export for Grafana or external dashboards
-
-Export parsed rows to CSV and JSON:
+## Export for external dashboards
 
 ```powershell
 python .\training_log_plotter.py --select --no-show --export-csv output\logs\metrics_export.csv --export-json output\logs\metrics_export.json
 ```
 
-Each row includes run name, timestamp, step, and all parsed scalar fields from the compact [train][backend] lines.
+## What to compare across runs
+
+1. **Loss curve** — prediction accuracy (can improve while language quality degrades)
+2. **`[REGIME]` phi/regime trend** — representational integrity
+3. **Milestone probe text** — greedy vs sampled at 25/50/75/100%
+4. **Trajectory score J** — single scalar from `regime_policy_optimizer.py`
+
+See [REGIME_CONTROLLER.md](REGIME_CONTROLLER.md) for metric definitions.

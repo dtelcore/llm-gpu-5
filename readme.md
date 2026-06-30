@@ -17,6 +17,19 @@ This repository is a Kepler/GT730-focused GPT training and generation project. T
 - Default training context: 128 tokens when VRAM allows
 - auto_train UX: summary screen now appears first, with explicit confirmation before expensive tokenizer/VRAM preflight and training start
 
+- auto_train UX: preset menu shows VRAM/speed/collapse-risk cost cards; Regime Controller probes language quality every 100 steps
+- Regime telemetry: `output/regime_metrics_latest.jsonl`; offline trajectory scoring via `regime_policy_optimizer.py`
+- Label smoothing: default 0.1 in `RunConfig`; fused cross-entropy kernel in `core/loss.py`
+- Default `small` preset: `embedding_dim=64` (aligned with 4096-token vocab)
+
+## Latest Progress (July 2026)
+
+- **Phase 2C fused attention:** single-kernel `fused_attention_forward_kernel` (QKt + softmax + PV) wired into production `model/gpt.py` — one launch instead of two, probs row stays in shared memory between softmax and PV.
+- **GPU-resident MHA integration:** `MultiHeadAttention` uses GPU layout adapters + fused forward; validated by `test_mha_integration_parity.py` and `smoke_train_mha_integration.py`.
+- **Label smoothing:** `RunConfig.label_smoothing` threaded through `auto_train.py` and `train.py`; kernel-level tests in `test_label_smoothing_loss.py`.
+- **Regime Controller:** BIS/TTR/RCI/Phi telemetry + bounded mid-run control (`label_smoothing`, `lr_regime_multiplier`) in `auto_train.py`; see [docs/REGIME_CONTROLLER.md](docs/REGIME_CONTROLLER.md).
+- **Trajectory scoring:** `regime_policy_optimizer.py` scores past runs for faster semantic emergence, stable dwell, and lower fragmentation.
+
 ## Latest Progress (June 2026)
 
 - Added GPU-resident FeedForward backward pass, eliminating the CPU/NumPy round-trip from FFN gradients; legacy CPU path kept as a togglable correctness oracle (`use_cpu_backward`).
@@ -45,6 +58,8 @@ This repository is a Kepler/GT730-focused GPT training and generation project. T
 cd "C:\dev\llm gpu 5"
 .\venv\Scripts\Activate.ps1
 python .\auto_train.py
+python .\regime_policy_optimizer.py output\regime_metrics_latest.jsonl
+python .\test_regime_monitor.py
 python .\generate.py --checkpoint output/checkpoints/<checkpoint>.npz --prompt "the" --max_new_tokens 40
 python .\training_log_plotter.py --select
 python .\training_log_plotter.py --select --no-show --export-csv output/logs/metrics_export.csv
@@ -65,4 +80,4 @@ If tokenizer behavior changes, clear cache before the next run:
 Remove-Item -Path "output\cache\tokenizer\*" -Recurse -Force
 ```
 
-For the latest operational notes, start with [index.md](index.md), then open the docs folder for the detailed workflow and log guidance.
+For the latest operational notes, start with [docs/index.md](docs/index.md), then open [docs/REGIME_CONTROLLER.md](docs/REGIME_CONTROLLER.md) for language-quality telemetry.
