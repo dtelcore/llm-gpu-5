@@ -417,6 +417,83 @@ extern "C" {
 """
 
 # ============================================================================
+# 14. GELU BACKWARD KERNEL (Tanh-Approximation Derivative)
+# ============================================================================
+GELU_BACKWARD_KERNEL = """
+extern "C" {
+    __global__ void gelu_backward_kernel(
+        const float* __restrict__ d_dOut,          // Upstream gradient
+        const float* __restrict__ d_pre_act,        // Saved pristine pre-activation (pre-GELU) state
+        float* __restrict__ d_dIn,                  // Resulting gradient
+        const int total_elements
+    ) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total_elements) return;
+
+        float x = d_pre_act[idx];
+        float x_cube = x * x * x;
+        float z = 0.7978845608f * (x + 0.044715f * x_cube);
+        float tanh_z = tanhf(z);
+        float sech2_z = 1.0f - (tanh_z * tanh_z);
+        float dz_dx = 0.7978845608f * (1.0f + 0.134145f * (x * x));
+
+        float local_grad = 0.5f * (1.0f + tanh_z) + 0.5f * x * sech2_z * dz_dx;
+        d_dIn[idx] = d_dOut[idx] * local_grad;
+    }
+}
+"""
+
+# ============================================================================
+# 15. AXIS-0 REDUCTION KERNEL (Column-Sum-Over-Rows via Atomic Accumulation)
+# ============================================================================
+REDUCE_SUM_AXIS0_KERNEL = """
+extern "C" {
+    __global__ void reduce_sum_axis0_kernel(
+        const float* __restrict__ d_input,     // Input tensor: logically (num_rows, channels)
+        float* __restrict__ d_output,          // Output column-sum accumulator: shape (channels), pre-zeroed
+        const int num_rows,
+        const int channels,
+        const int stride_row                   // Elements between consecutive rows (supports non-contiguous layouts)
+    ) {
+        int row = blockIdx.x * blockDim.x + threadIdx.x;
+        if (row >= num_rows) return;
+
+        int row_offset = row * stride_row;
+        for (int c = 0; c < channels; ++c) {
+            atomicAdd(&d_output[c], d_input[row_offset + c]);
+        }
+    }
+}
+"""
+
+# ============================================================================
+# 16. MATMUL BACKWARD (W.R.T. INPUT, IMPLICIT TRANSPOSE-B)
+# ============================================================================
+MATMUL_BACKWARD_INPUT_KERNEL = """
+extern "C" {
+    __global__ void matmul_backward_input_kernel(
+        const float* __restrict__ d_dOut,     // Upstream gradient tensor: shape (M, N)
+        const float* __restrict__ d_W,        // Forward weight matrix, natural layout: shape (K, N)
+        float* __restrict__ d_dIn,            // Output Input Gradient: shape (M, K)
+        const int M, const int N, const int K
+    ) {
+        // Computes dIn = dOut @ W^T without physically transposing W:
+        // dIn[m, k] = sum_n dOut[m, n] * W[k, n]
+        int row = blockIdx.y * blockDim.y + threadIdx.y; // M Index
+        int col = blockIdx.x * blockDim.x + threadIdx.x; // K Index
+
+        if (row >= M || col >= K) return;
+
+        float accum = 0.0f;
+        for (int n = 0; n < N; ++n) {
+            accum += d_dOut[row * N + n] * d_W[col * N + n];
+        }
+        d_dIn[row * K + col] = accum;
+    }
+}
+"""
+
+# ============================================================================
 # 13. STATEFUL ADAMW OPTIMIZER WEIGHT UPDATE KERNEL
 # ============================================================================
 ADAMW_UPDATE_KERNEL = """
@@ -480,4 +557,9 @@ KERNELS = {
     "matmul_backward_weights_kernel": MATMUL_BACKWARD_WEIGHTS_KERNEL,
     "layernorm_backward_kernel": LAYERNORM_BACKWARD_KERNEL,
     "adamw_update_kernel": ADAMW_UPDATE_KERNEL,
+
+    # GPU-Resident FeedForward Backward Primitives (Phase 2)
+    "gelu_backward_kernel": GELU_BACKWARD_KERNEL,
+    "reduce_sum_axis0_kernel": REDUCE_SUM_AXIS0_KERNEL,
+    "matmul_backward_input_kernel": MATMUL_BACKWARD_INPUT_KERNEL,
 }

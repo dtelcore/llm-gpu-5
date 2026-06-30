@@ -26,9 +26,10 @@ import numpy as np
 import pycuda.driver as cuda
 from logging_config import logger
 from core.ops import (
-    EmbeddingLookup, ElementwiseAdd, LayerNorm, MatMul2D, 
-    MatmulStrided, CausalSoftmax, GELU, Dropout, 
-    MatMulBackwardWeights, LayerNormBackward, AdamW
+    EmbeddingLookup, ElementwiseAdd, LayerNorm, MatMul2D,
+    MatmulStrided, CausalSoftmax, GELU, Dropout,
+    MatMulBackwardWeights, LayerNormBackward, AdamW,
+    GELUBackward, ReduceSumAxis0, MatMulBackwardInput
 )
 
 
@@ -84,6 +85,17 @@ class GPTConfig:
         assert self.embedding_dim % self.num_heads == 0, "embedding_dim must be divisible by num_heads"
 
 
+_GRAD_ACCUM_ADD_OP = None
+
+
+def _get_grad_accum_add_op():
+    """Lazily-initialized shared ElementwiseAdd kernel for on-device gradient accumulation."""
+    global _GRAD_ACCUM_ADD_OP
+    if _GRAD_ACCUM_ADD_OP is None:
+        _GRAD_ACCUM_ADD_OP = ElementwiseAdd()
+    return _GRAD_ACCUM_ADD_OP
+
+
 class Parameter:
     """Manages the lifetime of a weight tensor and its complete AdamW historical states in VRAM.
     
@@ -133,12 +145,9 @@ class Parameter:
 
     def set_or_accumulate_grads_from_gpu(self, gpu_grads_ptr, accumulate=False):
         if accumulate:
-            host_new = np.empty(self.shape, dtype=np.float32)
-            cuda.memcpy_dtoh(host_new, gpu_grads_ptr)
-            existing = np.empty(self.shape, dtype=np.float32)
-            cuda.memcpy_dtoh(existing, self.gpu_grads)
-            combined = existing + host_new
-            cuda.memcpy_htod(self.gpu_grads, combined.astype(np.float32, copy=False))
+            # On-device accumulation: gpu_grads += gpu_grads_ptr (no D2H/H2D round trips)
+            add_op = _get_grad_accum_add_op()
+            add_op(self.gpu_grads, gpu_grads_ptr, self.total_elements)
         else:
             cuda.memcpy_dtod(self.gpu_grads, gpu_grads_ptr, self.bytes_size)
 
@@ -299,12 +308,19 @@ class FeedForward:
         self.matmul_op = MatMul2D()
         self.act_op = GELU()
         self.weight_bwd_op = MatMulBackwardWeights()
+        self.bwd_input_op = MatMulBackwardInput()
+        self.reduce_op = ReduceSumAxis0()
+        self.gelu_bwd_op = GELUBackward()
 
         # Cache variables to hold forward activations for backward gradient computation
         self.cache_input = None
         self.cache_pre_act = None
         self.cache_activated = None
         self.training = True
+
+        # Set True to force the legacy host NumPy backward path (used as a numerical oracle
+        # for parity testing against the GPU-resident path below).
+        self.use_cpu_backward = False
 
     def forward(self, gpu_input, B: int, T: int):
         """Execute feed-forward forward pass with cached activations.
@@ -329,8 +345,11 @@ class FeedForward:
         gpu_hidden = self.matmul_op(gpu_input, self.c_fc_w.gpu_weights, self.c_fc_b.gpu_weights, M, N, K)
         
         if getattr(self, 'training', True):
-            self.cache_pre_act = np.empty((M, N), dtype=np.float32)
-            cuda.memcpy_dtoh(self.cache_pre_act, gpu_hidden)
+            # Cache the pristine pre-activation (pre-GELU) state in VRAM, before the
+            # in-place GELU below overwrites gpu_hidden. Stays GPU-resident for both
+            # the CPU-oracle and GPU-resident backward paths.
+            self.cache_pre_act = cuda.mem_alloc(M * N * 4)
+            cuda.memcpy_dtod(self.cache_pre_act, gpu_hidden, M * N * 4)
             
         # Layer 2: In-place GELU Activation
         self.act_op(gpu_hidden, M * N)
@@ -360,44 +379,78 @@ class FeedForward:
         M = B * T
         C = self.config.embedding_dim
 
-        host_dOut = np.empty((M, C), dtype=np.float32)
-        host_input = np.empty((M, C), dtype=np.float32)
-        host_activated = np.empty((M, C * 4), dtype=np.float32)
-        host_c_proj_w = np.empty(self.c_proj_w.shape, dtype=np.float32)
-        host_c_fc_w = np.empty(self.c_fc_w.shape, dtype=np.float32)
+        if getattr(self, 'use_cpu_backward', False):
+            # --- LEGACY CPU-ORACLE PATH (host NumPy math, kept for parity testing) ---
+            host_dOut = np.empty((M, C), dtype=np.float32)
+            host_input = np.empty((M, C), dtype=np.float32)
+            host_activated = np.empty((M, C * 4), dtype=np.float32)
+            host_pre_act = np.empty((M, C * 4), dtype=np.float32)
+            host_c_proj_w = np.empty(self.c_proj_w.shape, dtype=np.float32)
+            host_c_fc_w = np.empty(self.c_fc_w.shape, dtype=np.float32)
 
-        cuda.memcpy_dtoh(host_dOut, gpu_dOut)
-        cuda.memcpy_dtoh(host_input, self.cache_input)
-        cuda.memcpy_dtoh(host_activated, self.cache_activated)
-        cuda.memcpy_dtoh(host_c_proj_w, self.c_proj_w.gpu_weights)
-        cuda.memcpy_dtoh(host_c_fc_w, self.c_fc_w.gpu_weights)
+            cuda.memcpy_dtoh(host_dOut, gpu_dOut)
+            cuda.memcpy_dtoh(host_input, self.cache_input)
+            cuda.memcpy_dtoh(host_activated, self.cache_activated)
+            cuda.memcpy_dtoh(host_pre_act, self.cache_pre_act)
+            cuda.memcpy_dtoh(host_c_proj_w, self.c_proj_w.gpu_weights)
+            cuda.memcpy_dtoh(host_c_fc_w, self.c_fc_w.gpu_weights)
 
-        host_dProjW = host_activated.T @ host_dOut
-        host_dProjB = np.sum(host_dOut, axis=0)
+            host_dProjW = host_activated.T @ host_dOut
+            host_dProjB = np.sum(host_dOut, axis=0)
 
-        host_dHidden = host_dOut @ host_c_proj_w.T
-        
-        x = self.cache_pre_act
-        y = x + 0.044715 * (x ** 3)
-        z = 0.7978845608 * y
-        tanh_z = np.tanh(z)
-        sech2_z = 1.0 - (tanh_z ** 2)
-        dz_dx = 0.7978845608 * (1.0 + 0.134145 * (x ** 2))
-        grad = 0.5 * (1.0 + tanh_z) + 0.5 * x * sech2_z * dz_dx
-        
-        host_dHidden *= grad
+            host_dHidden = host_dOut @ host_c_proj_w.T
 
-        host_dFcW = host_input.T @ host_dHidden
-        host_dFcB = np.sum(host_dHidden, axis=0)
-        host_dIn = host_dHidden @ host_c_fc_w.T
+            x = host_pre_act
+            y = x + 0.044715 * (x ** 3)
+            z = 0.7978845608 * y
+            tanh_z = np.tanh(z)
+            sech2_z = 1.0 - (tanh_z ** 2)
+            dz_dx = 0.7978845608 * (1.0 + 0.134145 * (x ** 2))
+            grad = 0.5 * (1.0 + tanh_z) + 0.5 * x * sech2_z * dz_dx
 
-        self.c_proj_w.set_or_accumulate_grads(host_dProjW, accumulate=accumulate)
-        self.c_proj_b.set_or_accumulate_grads(host_dProjB, accumulate=accumulate)
-        self.c_fc_w.set_or_accumulate_grads(host_dFcW, accumulate=accumulate)
-        self.c_fc_b.set_or_accumulate_grads(host_dFcB, accumulate=accumulate)
+            host_dHidden *= grad
 
-        gpu_dIn = cuda.mem_alloc(host_dIn.nbytes)
-        cuda.memcpy_htod(gpu_dIn, host_dIn.astype(np.float32))
+            host_dFcW = host_input.T @ host_dHidden
+            host_dFcB = np.sum(host_dHidden, axis=0)
+            host_dIn = host_dHidden @ host_c_fc_w.T
+
+            self.c_proj_w.set_or_accumulate_grads(host_dProjW, accumulate=accumulate)
+            self.c_proj_b.set_or_accumulate_grads(host_dProjB, accumulate=accumulate)
+            self.c_fc_w.set_or_accumulate_grads(host_dFcW, accumulate=accumulate)
+            self.c_fc_b.set_or_accumulate_grads(host_dFcB, accumulate=accumulate)
+
+            gpu_dIn = cuda.mem_alloc(host_dIn.nbytes)
+            cuda.memcpy_htod(gpu_dIn, host_dIn.astype(np.float32))
+            return gpu_dIn
+
+        # --- GPU-RESIDENT PATH (no D2H/H2D round trips) ---
+        # 1. c_proj gradients: dProjW = activated^T @ dOut, dProjB = sum(dOut, axis=0),
+        #    dHidden = dOut @ c_proj_w^T (implicit transpose, no physical weight transpose)
+        gpu_dProjW = self.weight_bwd_op(self.cache_activated, gpu_dOut, M, C, C * 4)
+        gpu_dProjB = self.reduce_op(gpu_dOut, M, C, C)
+        gpu_dHidden = self.bwd_input_op(gpu_dOut, self.c_proj_w.gpu_weights, M, C, C * 4)
+
+        # 2. Backprop through GELU using the pristine cached pre-activation state
+        gpu_dPreAct = self.gelu_bwd_op(gpu_dHidden, self.cache_pre_act, M * C * 4)
+        gpu_dHidden.free()  # Ephemeral intermediate
+
+        # 3. c_fc gradients: dFcW = input^T @ dPreAct, dFcB = sum(dPreAct, axis=0),
+        #    dIn = dPreAct @ c_fc_w^T (implicit transpose)
+        gpu_dFcW = self.weight_bwd_op(self.cache_input, gpu_dPreAct, M, C * 4, C)
+        gpu_dFcB = self.reduce_op(gpu_dPreAct, M, C * 4, C * 4)
+        gpu_dIn = self.bwd_input_op(gpu_dPreAct, self.c_fc_w.gpu_weights, M, C * 4, C)
+        gpu_dPreAct.free()  # Ephemeral intermediate
+
+        # 4. In-place on-device gradient accumulation (no host round trips)
+        self.c_proj_w.set_or_accumulate_grads_from_gpu(gpu_dProjW, accumulate=accumulate)
+        gpu_dProjW.free()
+        self.c_proj_b.set_or_accumulate_grads_from_gpu(gpu_dProjB, accumulate=accumulate)
+        gpu_dProjB.free()
+        self.c_fc_w.set_or_accumulate_grads_from_gpu(gpu_dFcW, accumulate=accumulate)
+        gpu_dFcW.free()
+        self.c_fc_b.set_or_accumulate_grads_from_gpu(gpu_dFcB, accumulate=accumulate)
+        gpu_dFcB.free()
+
         return gpu_dIn
 
     def free_forward_caches(self):
@@ -408,7 +461,9 @@ class FeedForward:
         if self.cache_input is not None:
             self.cache_input.free()
             self.cache_input = None
-        self.cache_pre_act = None
+        if self.cache_pre_act is not None:
+            self.cache_pre_act.free()
+            self.cache_pre_act = None
 
 
 

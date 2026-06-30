@@ -21,11 +21,14 @@ class RunConfig:
     batch_size: int = 1
     grad_accum: int = 16
     learning_rate: float = 0.015
-    total_steps: int = 1000
+    total_steps: int = 60
     
     # Dataset
     dataset: str = "fineweb"
     corpus_limit: int = 5000
+
+    # Validation cadence (decoupled from logging interval)
+    val_interval: int = 100
     
     # Run identity
     name: str = "gpt_model"
@@ -33,6 +36,10 @@ class RunConfig:
     
     # Additional paths
     init_checkpoint_path: str = None
+
+    # Profiling
+    profile_gpu_timing: bool = False
+    profile_memcpy: bool = False
     
     def __post_init__(self):
         if self.embedding_dim % self.num_heads != 0:

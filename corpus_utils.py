@@ -6,6 +6,7 @@ import os
 import unicodedata
 
 import numpy as np
+from tqdm import tqdm
 
 from logging_config import logger
 
@@ -44,7 +45,7 @@ def normalize_corpus_text(text, preserve_trailing_newline=True):
 def _read_text_corpus(file_path):
     documents = []
     with open(file_path, 'r', encoding='utf-8') as handle:
-        for raw_line in handle:
+        for raw_line in tqdm(handle, desc=f"Loading corpus: {os.path.basename(file_path)}", unit="line"):
             normalized = normalize_corpus_text(raw_line, preserve_trailing_newline=True)
             if normalized.strip():
                 if not normalized.endswith('\n'):

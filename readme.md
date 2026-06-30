@@ -17,6 +17,14 @@ This repository is a Kepler/GT730-focused GPT training and generation project. T
 - Default training context: 128 tokens when VRAM allows
 - auto_train UX: summary screen now appears first, with explicit confirmation before expensive tokenizer/VRAM preflight and training start
 
+## Latest Progress (June 2026)
+
+- Added GPU-resident FeedForward backward pass, eliminating the CPU/NumPy round-trip from FFN gradients; legacy CPU path kept as a togglable correctness oracle (`use_cpu_backward`).
+- Added Phase 3 Multi-Head Attention CUDA kernels (`core/mha_kernels.py`) with a strict Score-Space / Projection-Space / Meta-Space memory model: causal score matmul, fused causal softmax forward/backward (VJP form), and projection-space `dQ`/`dK`/`dV` gradient kernels.
+- Added a NumPy golden-model validation harness (`test_mha_golden_model.py`) gating MHA kernel correctness before any tiling/fusion optimization work, plus an FFN backward parity harness (`test_ffn_gpu_backward.py`).
+- Centralized all GPU kernels into a single shared `SourceModule` compilation pass and added a cosine warmup learning-rate scheduler.
+- Added live `tqdm` progress bars to tokenizer building and corpus file loading so large multi-million-document runs no longer appear to hang.
+
 ## Latest Progress (May 2026)
 
 - Hardened leak-free validation behavior: tokenizer can be built from the training split while still safely encoding unseen validation symbols through byte fallback.

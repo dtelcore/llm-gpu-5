@@ -437,6 +437,101 @@ class LayerNormBackward:
         return gpu_dIn, gpu_dGamma, gpu_dBeta
 
 
+class GELUBackward:
+    """GELU Gradient via Tanh-Approximation Derivative.
+
+    Recomputes the GELU derivative per-element directly from the saved pristine
+    pre-activation (pre-GELU) state, avoiding any host round-trip.
+    """
+    def __init__(self):
+        self.func = _SHARED_GPU_MODULE.get_function("gelu_backward_kernel")
+
+    def __call__(self, gpu_dOut, gpu_forward_act, total_elements: int):
+        """Execute GELU backward kernel.
+
+        Args:
+            gpu_dOut: GPU pointer to upstream gradient (float32)
+            gpu_forward_act: GPU pointer to saved pristine pre-activation state [total_elements] (float32)
+            total_elements: Total number of elements
+
+        Returns:
+            gpu_dIn: Downstream gradient (float32)
+        """
+        gpu_dIn = cuda.mem_alloc(total_elements * 4)
+
+        threads = 256
+        blocks = (total_elements + threads - 1) // threads
+
+        self.func(gpu_dOut, gpu_forward_act, gpu_dIn, np.int32(total_elements),
+                  block=(threads, 1, 1), grid=(blocks, 1))
+        return gpu_dIn
+
+
+class ReduceSumAxis0:
+    """Column-Sum-Over-Rows Reduction via Atomic Accumulation.
+
+    Computes output[c] = sum_row input[row, c] for a logically (num_rows, channels)
+    tensor, supporting an arbitrary row stride for non-contiguous layouts.
+    """
+    def __init__(self):
+        self.func = _SHARED_GPU_MODULE.get_function("reduce_sum_axis0_kernel")
+
+    def __call__(self, gpu_input, num_rows: int, channels: int, stride_row: int):
+        """Execute axis-0 reduction kernel.
+
+        Args:
+            gpu_input: GPU pointer to input tensor (float32)
+            num_rows: Number of rows to reduce over
+            channels: Number of output columns
+            stride_row: Elements between consecutive rows in gpu_input
+
+        Returns:
+            gpu_output: GPU pointer to column-sum accumulator [channels] (float32)
+        """
+        gpu_output = cuda.mem_alloc(channels * 4)
+        cuda.memset_d8(gpu_output, 0, channels * 4)
+
+        threads = 256
+        blocks = (num_rows + threads - 1) // threads
+
+        self.func(gpu_input, gpu_output, np.int32(num_rows), np.int32(channels), np.int32(stride_row),
+                  block=(threads, 1, 1), grid=(blocks, 1))
+        return gpu_output
+
+
+class MatMulBackwardInput:
+    """Input Gradient Computation via Implicit Transpose-B Matmul: dX = dOut @ W^T.
+
+    Computes input gradients without physically transposing the weight matrix,
+    reading W in its natural [K, N] on-device layout.
+    """
+    def __init__(self):
+        self.func = _SHARED_GPU_MODULE.get_function("matmul_backward_input_kernel")
+
+    def __call__(self, gpu_dOut, gpu_W, M: int, N: int, K: int):
+        """Execute input-gradient matmul kernel.
+
+        Args:
+            gpu_dOut: GPU pointer to upstream gradient [M, N] (float32)
+            gpu_W: GPU pointer to forward weight matrix, natural layout [K, N] (float32)
+            M: Batch/sequence dimension
+            N: Contraction dimension (dOut's feature dimension)
+            K: Output feature dimension (dIn's feature dimension, W's first axis)
+
+        Returns:
+            gpu_dIn: Input gradient tensor [M, K] (float32)
+        """
+        gpu_dIn = cuda.mem_alloc(M * K * 4)
+
+        block_dim = 16
+        block = (block_dim, block_dim, 1)
+        grid = ((K + block_dim - 1) // block_dim, (M + block_dim - 1) // block_dim)
+
+        self.func(gpu_dOut, gpu_W, gpu_dIn, np.int32(M), np.int32(N), np.int32(K),
+                  block=block, grid=grid)
+        return gpu_dIn
+
+
 class AdamW:
     """Stateful AdamW Optimizer: Decoupled Weight Decay + Exponential Moving Averages.
     

@@ -1,0 +1,2 @@
+FROM deepseek-r1:1.5b
+SYSTEM "You are a helpful AI assistant. You must think and respond exclusively in English. Never use Chinese."

@@ -390,9 +390,16 @@ def build_generation_model(tokenizer, checkpoint_path, num_heads=None):
 
 def build_tokenizer_for_checkpoint(checkpoint_path, expected_vocab_size, source_docs=None, dataset_path=None):
     """Build the shared tokenizer using the specified dataset, prioritizing static vocabulary."""
+    import re
     from pathlib import Path
     cp_path = Path(checkpoint_path)
-    vocab_name = cp_path.name.replace('.best.npz', '.json').replace('.npz', '.json')
+    # Strip step/progress suffixes (.step10000.p100, .best) before .npz so that
+    # the derived vocab name matches the run-level vocab file (e.g. vocab_..._003916.json)
+    # rather than a non-existent per-step copy (vocab_..._003916.step10000.p100.json).
+    stem = cp_path.name
+    stem = re.sub(r'\.step\d+\.p\d+\.npz$', '.npz', stem)
+    stem = stem.replace('.best.npz', '.npz')
+    vocab_name = stem.replace('.npz', '.json')
     if vocab_name.startswith('training_'):
         vocab_name = vocab_name.replace('training_', 'vocab_', 1)
     elif vocab_name.startswith('gpt_'):

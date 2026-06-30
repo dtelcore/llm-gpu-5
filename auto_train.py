@@ -587,13 +587,18 @@ class InteractiveTrainer:
         return checkpoint_path, checkpoint_config
 
     def _init_checkpoint_prompt_mismatches(self, checkpoint_config):
-        """Return prompt-time config differences between the selected run and checkpoint."""
+        """Return prompt-time config differences between the selected run and checkpoint.
+
+        vocab_size is intentionally included here so the user is asked to adopt the
+        checkpoint's vocabulary at selection time rather than crashing at training time.
+        """
         config_fields = [
             ('seq_len', 'ctx', checkpoint_config.max_len),
             ('embedding_dim', 'embed', checkpoint_config.embedding_dim),
             ('num_heads', 'heads', checkpoint_config.num_heads),
             ('num_layers', 'layers', checkpoint_config.num_layers),
             ('attention_impl', 'attention', checkpoint_config.attention_impl),
+            ('vocab_size', 'vocab', checkpoint_config.vocab_size),
         ]
 
         mismatches = []
@@ -612,13 +617,18 @@ class InteractiveTrainer:
         return "custom"
 
     def _apply_init_checkpoint_model_config(self, checkpoint_config):
-        """Align the requested run with the selected checkpoint architecture."""
+        """Align the requested run with the selected checkpoint architecture.
+
+        vocab_size is adopted here so the tokenizer preflight and model config
+        both use the checkpoint's vocabulary size instead of a corpus-derived one.
+        """
         self.config['name'] = self._infer_model_name_from_checkpoint(checkpoint_config)
         self.config['embedding_dim'] = checkpoint_config.embedding_dim
         self.config['num_heads'] = checkpoint_config.num_heads
         self.config['num_layers'] = checkpoint_config.num_layers
         self.config['attention_impl'] = checkpoint_config.attention_impl
         self.config['seq_len'] = checkpoint_config.max_len
+        self.config['vocab_size'] = checkpoint_config.vocab_size
         self.config['approx_params'] = estimate_model_params(
             PARAMETER_PRESET_ASSUMED_VOCAB,
             checkpoint_config.max_len,
@@ -1085,20 +1095,78 @@ class InteractiveTrainer:
 
         print("\nPreparing tokenizer and VRAM estimate...")
 
-        # Build tokenizer on the same train split used by train() so we can reuse it.
-        preflight_train_corpus, _ = split_corpus_for_validation(self.config['corpus'])
-        print(f"Tokenizer preflight docs (train split): {len(preflight_train_corpus):,}")
+        # When an init checkpoint is present, resolve its vocab_size now if it was not
+        # already stored by _apply_init_checkpoint_model_config (which is only called when
+        # there are architecture mismatches).  Without this, forced_vocab_size stays None
+        # and we would pass max_vocab_size=None to the tokenizer constructor, crashing it.
+        init_checkpoint_path = self.config.get('init_checkpoint_path')
+        forced_vocab_size = self.config.get('vocab_size')
+        if init_checkpoint_path and forced_vocab_size is None:
+            try:
+                _, _cp_cfg = self._resolve_init_checkpoint_config(init_checkpoint_path)
+                forced_vocab_size = _cp_cfg.vocab_size
+                self.config['vocab_size'] = forced_vocab_size
+            except Exception as _exc:
+                print(f"[WARN] Could not read checkpoint vocab size ({_exc}); will derive from corpus")
 
-        estimated_tokenizer, _, _ = build_shared_tokenizer(
-            self.config.get('dataset', 'fineweb'),
-            source_docs=preflight_train_corpus,
-            fallback_docs=preflight_train_corpus,
-        )
-        estimated_vocab_size = estimated_tokenizer.vocab_size
-        self.config['estimated_vocab_size'] = estimated_vocab_size
-        self.config['preflight_tokenizer_ready'] = True
-        self.config['preflight_tokenizer_docs'] = len(preflight_train_corpus)
-        self.tokenizer = estimated_tokenizer
+        loaded_from_vocab_file = False
+        if init_checkpoint_path and forced_vocab_size:
+            # Load the static vocab JSON that was saved alongside the checkpoint so the
+            # preflight tokenizer is byte-for-byte identical to what training used.
+            import re as _re
+            from pathlib import Path as _Path
+            cp = _Path(init_checkpoint_path)
+            stem = cp.name
+            stem = _re.sub(r'\.step\d+\.p\d+\.npz$', '.npz', stem)
+            stem = stem.replace('.best.npz', '.npz')
+            vocab_json_name = stem.replace('.npz', '.json')
+            if vocab_json_name.startswith('gpt_'):
+                vocab_json_name = vocab_json_name.replace('gpt_', 'vocab_', 1)
+            elif vocab_json_name.startswith('training_'):
+                vocab_json_name = vocab_json_name.replace('training_', 'vocab_', 1)
+            else:
+                vocab_json_name = 'vocab_' + vocab_json_name
+            vocab_json_path = cp.parent / vocab_json_name
+            if vocab_json_path.exists():
+                try:
+                    static_tokenizer = CharacterGPTTokenizer.load_vocab(str(vocab_json_path))
+                    if static_tokenizer.vocab_size == forced_vocab_size:
+                        print(f"[OK] Loaded static vocab from checkpoint: {vocab_json_path.name}")
+                        print(f"     Vocab size: {static_tokenizer.vocab_size}")
+                        self.tokenizer = static_tokenizer
+                        self.config['estimated_vocab_size'] = static_tokenizer.vocab_size
+                        self.config['preflight_tokenizer_ready'] = True
+                        self.config['preflight_tokenizer_docs'] = len(self.config['corpus'])
+                        loaded_from_vocab_file = True
+                    else:
+                        print(f"[WARN] Static vocab size {static_tokenizer.vocab_size} != expected {forced_vocab_size}, falling back to corpus preflight")
+                except Exception as exc:
+                    print(f"[WARN] Could not load static vocab ({exc}), falling back to corpus preflight")
+            else:
+                print(f"[INFO] No static vocab JSON found at {vocab_json_path}, running corpus preflight")
+
+        if not loaded_from_vocab_file:
+            # Build tokenizer on the same train split used by train() so we can reuse it.
+            preflight_train_corpus, _ = split_corpus_for_validation(self.config['corpus'])
+            print(f"Tokenizer preflight docs (train split): {len(preflight_train_corpus):,}")
+
+            tokenizer_kwargs = dict(
+                source_docs=preflight_train_corpus,
+                fallback_docs=preflight_train_corpus,
+            )
+            if forced_vocab_size is not None:
+                tokenizer_kwargs['max_vocab_size'] = forced_vocab_size
+
+            estimated_tokenizer, _, _ = build_shared_tokenizer(
+                self.config.get('dataset', 'fineweb'),
+                **tokenizer_kwargs,
+            )
+            self.tokenizer = estimated_tokenizer
+            self.config['preflight_tokenizer_ready'] = True
+            self.config['preflight_tokenizer_docs'] = len(preflight_train_corpus)
+            self.config['estimated_vocab_size'] = self.tokenizer.vocab_size
+
+        estimated_vocab_size = self.config['estimated_vocab_size']
         print(f"Estimated tokenizer vocab: {estimated_vocab_size}")
 
         print("\nStage 1 -> Stage 2 handoff rule:")

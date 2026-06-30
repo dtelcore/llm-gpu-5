@@ -15,6 +15,7 @@ Target: NVIDIA GeForce GT 730 (Kepler) with 1-2GB VRAM constraint
 """
 
 import os
+import time
 import numpy as np
 import pycuda.driver as cuda
 
@@ -23,6 +24,8 @@ import env_config
 import pycuda.autoinit
 import subprocess
 import sys
+
+from gpu_timing import GpuProfiler
 
 from corpus_utils import (
     TRAINING_CORPUS,
@@ -54,6 +57,11 @@ PROBE_MEMORIZATION_PREFIX_LEN = 32
 def run_training_engine():
     """Main training orchestrator: load → tokenize → forward → loss → backward → optimize."""
     install_global_memory_pool()
+
+    # Force UTF-8 for spawned plotter subprocesses without disturbing the rest of the
+    # inherited environment (avoids UnicodeEncodeError on Windows' default cp1252 console).
+    plotter_env = os.environ.copy()
+    plotter_env["PYTHONIOENCODING"] = "utf-8"
 
     logger.info("="*73)
     logger.info("[INIT] INITIALIZING CUSTOM Kepler GT 730 TRAINING BACKEND ENGINE")
@@ -171,6 +179,12 @@ def run_training_engine():
     cuda.memcpy_htod(gpu_val_input_tokens, val_input_tokens_sample.astype(np.int32))
     cuda.memcpy_htod(gpu_val_target_tokens, val_target_tokens_sample.astype(np.int32))
     logger.info("[OK] Data transferred to VRAM successfully")
+
+    # Dedicated stream + pinned (page-locked) host staging buffers for per-micro-step token batch
+    # uploads, enabling async H2D transfers that overlap with CPU-side batch sampling.
+    transfer_stream = cuda.Stream()
+    pinned_input_tokens = cuda.pagelocked_empty((B, T), dtype=np.int32)
+    pinned_target_tokens = cuda.pagelocked_empty((B, T), dtype=np.int32)
     
     N = B * T
     V = config.vocab_size
@@ -194,31 +208,74 @@ def run_training_engine():
     
     scheduler = CosineWarmupScheduler(max_lr=learning_rate, total_steps=total_steps, warmup_steps=min(200, total_steps // 10))
 
+    profiler = None
+    if run_config.profile_gpu_timing:
+        profiler_keys = ["step_gpu", "forward", "backward", "optimizer", "loss"]
+        if run_config.profile_memcpy:
+            profiler_keys.append("memcpy")
+        profiler = GpuProfiler(profiler_keys)
+
     try:
         for step in range(1, total_steps + 1):
             logger.debug(f"Step {step}: Starting forward/backward/optimize cycle")
             metrics.step_start()
 
+            start_wall_time = time.perf_counter()
+            free_mem_start, total_mem = cuda.mem_get_info()
+
+            step_zone = None
+            if profiler is not None:
+                step_zone = profiler.zone("step_gpu")
+                step_zone.__enter__()
+
             model.zero_grad()
             step_loss_value = 0.0
+            free_mem_post_fw = free_mem_start
+            free_mem_post_bw = free_mem_start
 
             for micro_step in range(grad_accum):
                 input_tokens_sample, target_tokens_sample, _ = sample_token_batch(raw_aligned_matrix, B, T, rng=batch_rng)
-                cuda.memcpy_htod(gpu_input_tokens, input_tokens_sample)
-                cuda.memcpy_htod(gpu_target_tokens, target_tokens_sample)
+                pinned_input_tokens[:] = input_tokens_sample
+                pinned_target_tokens[:] = target_tokens_sample
+
+                if profiler is not None and run_config.profile_memcpy:
+                    with profiler.zone("memcpy"):
+                        cuda.memcpy_htod_async(gpu_input_tokens, pinned_input_tokens, stream=transfer_stream)
+                        cuda.memcpy_htod_async(gpu_target_tokens, pinned_target_tokens, stream=transfer_stream)
+                        transfer_stream.synchronize()
+                else:
+                    cuda.memcpy_htod_async(gpu_input_tokens, pinned_input_tokens, stream=transfer_stream)
+                    cuda.memcpy_htod_async(gpu_target_tokens, pinned_target_tokens, stream=transfer_stream)
+                    transfer_stream.synchronize()
                 
                 # --- PHASE A: FORWARD PROPAGATION PASS ---
-                gpu_logits = model.forward(gpu_input_tokens, B, T)
+                if profiler is not None:
+                    with profiler.zone("forward"):
+                        gpu_logits = model.forward(gpu_input_tokens, B, T)
+                else:
+                    gpu_logits = model.forward(gpu_input_tokens, B, T)
+
+                free_mem_post_fw, _ = cuda.mem_get_info()
                 
                 # --- PHASE B: LOSS COMPUTATION & INITIAL GRADIENTS DERIVATION ---
-                micro_loss, gpu_dLogits = criterion(gpu_logits, gpu_target_tokens, N, V)
+                if profiler is not None:
+                    with profiler.zone("loss"):
+                        micro_loss, gpu_dLogits = criterion(gpu_logits, gpu_target_tokens, N, V)
+                else:
+                    micro_loss, gpu_dLogits = criterion(gpu_logits, gpu_target_tokens, N, V)
                 gpu_logits.free()
                 
                 step_loss_value += micro_loss / grad_accum
 
                 # --- PHASE C: MANUAL BACKPROPAGATION TRAVERSAL LOOP ---
-                model.backward(gpu_dLogits, B, T, scale=1.0/grad_accum, accumulate=True)
+                if profiler is not None:
+                    with profiler.zone("backward"):
+                        model.backward(gpu_dLogits, B, T, scale=1.0/grad_accum, accumulate=True)
+                else:
+                    model.backward(gpu_dLogits, B, T, scale=1.0/grad_accum, accumulate=True)
                 gpu_dLogits.free()
+
+                free_mem_post_bw, _ = cuda.mem_get_info()
                 
                 # --- PHASE E: MANDATORY PROACTIVE VRAM FOOTPRINT SCRUBBING ---
                 model.free_forward_caches()
@@ -252,7 +309,8 @@ def run_training_engine():
                 grad_norm = model.compute_grad_norm()
 
             val_loss = None
-            if metrics.should_log_step(step):
+            should_validate = step % run_config.val_interval == 0 or step == total_steps
+            if should_validate:
                 val_logits = model.forward(gpu_val_input_tokens, val_batch_size, T)
                 val_loss, gpu_val_dLogits = criterion(val_logits, gpu_val_target_tokens, val_batch_size * T, V)
                 val_logits.free()
@@ -261,9 +319,54 @@ def run_training_engine():
             
             # --- PHASE D: STATEFUL ADAMW WEIGHT OPTIMIZATION STEP ---
             current_lr = scheduler.get_lr(step)
-            model.update_weights(lr=current_lr, step=step)
+            if profiler is not None:
+                with profiler.zone("optimizer"):
+                    model.update_weights(lr=current_lr, step=step)
+            else:
+                model.update_weights(lr=current_lr, step=step)
             logger.debug(f"Step {step}: AdamW weight update applied (lr={current_lr:.6f})")
             pool_used_mb, pool_total_mb = get_memory_pool_stats_mb()
+
+            if step_zone is not None:
+                step_zone.__exit__(None, None, None)
+            if profiler is not None:
+                profiler.synchronize_and_accumulate()
+
+            if metrics.should_log_step(step):
+                total_wall_time = time.perf_counter() - start_wall_time
+
+                if profiler is not None:
+                    avgs = profiler.get_averages_and_reset()
+                    total_gpu_time = avgs.get("step_gpu", 0.0)
+                    tracked_gpu_parts = (
+                        avgs.get("forward", 0.0)
+                        + avgs.get("backward", 0.0)
+                        + avgs.get("optimizer", 0.0)
+                        + avgs.get("loss", 0.0)
+                    )
+                    untracked_gpu_time = total_gpu_time - tracked_gpu_parts
+                    non_gpu_wall_time = total_wall_time - total_gpu_time
+
+                    vram_base = (total_mem - free_mem_start) / (1024**2)
+                    vram_post_fw = (total_mem - free_mem_post_fw) / (1024**2)
+                    vram_post_bw = (total_mem - free_mem_post_bw) / (1024**2)
+
+                    print(
+                        f"\n[Step {step} Baseline] Wall: {total_wall_time:.4f}s | "
+                        f"Total GPU: {total_gpu_time:.4f}s | Non-GPU Wall Time: {non_gpu_wall_time:.4f}s"
+                    )
+                    print(
+                        f"  -> FW: {avgs.get('forward', 0.0):.4f}s | "
+                        f"BW: {avgs.get('backward', 0.0):.4f}s | "
+                        f"OPT: {avgs.get('optimizer', 0.0):.4f}s"
+                    )
+                    print(f"  -> Untracked GPU: {untracked_gpu_time:.4f}s")
+                    if run_config.profile_memcpy:
+                        print(f"  -> Memcpy: {avgs.get('memcpy', 0.0):.4f}s")
+                    print(
+                        f"  -> VRAM (MB) - Base: {vram_base:.1f} | "
+                        f"Post-FW: {vram_post_fw:.1f} | Post-BW: {vram_post_bw:.1f}"
+                    )
 
             metrics.step_end(
                 loss_value,
@@ -277,15 +380,15 @@ def run_training_engine():
             
             if step % 1000 == 0:
                 try:
-                    subprocess.Popen([sys.executable, "training_log_plotter.py", "--save", "output/training_metrics_latest.png", "--no-forecast"])
-                    subprocess.Popen([sys.executable, "loss_landscape_plotter.py"])
+                    subprocess.Popen([sys.executable, "training_log_plotter.py", "--save", "output/training_metrics_latest.png", "--no-forecast"], env=plotter_env)
+                    subprocess.Popen([sys.executable, "loss_landscape_plotter.py"], env=plotter_env)
                 except Exception as e:
                     logger.warning(f"Plotter failed to launch: {e}")
 
         metrics.finalize()
         try:
-            subprocess.Popen([sys.executable, "training_log_plotter.py", "--save", "output/training_metrics_latest.png", "--no-forecast"])
-            subprocess.Popen([sys.executable, "loss_landscape_plotter.py"])
+            subprocess.Popen([sys.executable, "training_log_plotter.py", "--save", "output/training_metrics_latest.png", "--no-forecast"], env=plotter_env)
+            subprocess.Popen([sys.executable, "loss_landscape_plotter.py"], env=plotter_env)
         except Exception:
             pass
         logger.info(f"\nGoal Metrics:")

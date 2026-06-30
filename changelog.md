@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-06-30
+
+- Added GPU-resident FeedForward backward pass (`core/ops.py`: `GELUBackward`, `ReduceSumAxis0`, `MatMulBackwardInput`), removing the CPU/NumPy round-trip from the FFN gradient path. Kept the legacy CPU backward as a togglable oracle (`use_cpu_backward`) for parity verification.
+- Added `test_ffn_gpu_backward.py`: parity + timing harness comparing the GPU-resident FFN backward against the CPU oracle path.
+- Added Phase 3 Multi-Head Attention CUDA kernels (`core/mha_kernels.py`): causal-masked score matmul, fused softmax forward/backward (VJP form, no explicit Jacobian), and projection-space gradient kernels for `dQ`/`dK`/`dV`, built around an explicit Score-Space / Projection-Space / Meta-Space memory model.
+- Added `test_mha_golden_model.py`: a NumPy golden-model parity harness validating the MHA kernels' forward (scores, probs, output) and backward (`dV`, softmax VJP, `dQ`, `dK`) against an independent reference implementation, including causal edge-row stress cases.
+- Added a cosine warmup learning-rate scheduler and centralized the GPU kernel compilation into a single shared `SourceModule` pass (`core/kernels.py`/`core/ops.py`) to reduce JIT startup overhead.
+- Added `tqdm` progress bars to the tokenizer build path (`tokenizer/hybrid_tokenizer.py` char/piece counting loops) and corpus file loading (`corpus_utils.py`), so large corpus runs (e.g. 2.85M-document TinyStories builds) show live progress instead of appearing frozen.
+- Added `gpu_timing.py` for lightweight step-level GPU timing instrumentation in the training loop.
+
 ## 2026-05-24
 
 - Repaired the shared corpus path so FineWeb and custom corpora preserve normalized newline structure instead of stripping it away.

@@ -2,6 +2,12 @@ import os
 import re
 import numpy as np
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is an optional UX dependency
+    def tqdm(iterable, **kwargs):
+        return iterable
+
 # Keep Python 3.8 isolated DLL environment mapping active for Windows GPU runtimes
 CUDA_BIN = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v10.1\bin"
 if hasattr(os, "add_dll_directory") and os.path.exists(CUDA_BIN):
@@ -39,7 +45,7 @@ class CharacterGPTTokenizer:
 
         normalized_docs = [str(doc) for doc in docs]
         char_counts = {}
-        for doc in normalized_docs:
+        for doc in tqdm(normalized_docs, desc="Tokenizer: counting chars", unit="doc"):
             for char in doc:
                 char_counts[char] = char_counts.get(char, 0) + 1
 
@@ -51,7 +57,7 @@ class CharacterGPTTokenizer:
         base_chars.sort(key=lambda char: (-char_counts[char], char))
 
         piece_counts = {}
-        for doc in normalized_docs:
+        for doc in tqdm(normalized_docs, desc="Tokenizer: counting pieces", unit="doc"):
             for piece in self.PIECE_PATTERN.findall(doc):
                 if len(piece) <= 1:
                     continue
