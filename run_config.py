@@ -27,6 +27,9 @@ class RunConfig:
     dataset: str = "fineweb"
     corpus_limit: int = 5000
 
+    # Regularization
+    label_smoothing: float = 0.1
+
     # Validation cadence (decoupled from logging interval)
     val_interval: int = 100
     

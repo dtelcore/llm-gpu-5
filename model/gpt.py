@@ -27,10 +27,12 @@ import pycuda.driver as cuda
 from logging_config import logger
 from core.ops import (
     EmbeddingLookup, ElementwiseAdd, LayerNorm, MatMul2D,
-    MatmulStrided, CausalSoftmax, GELU, Dropout,
+    GELU, Dropout,
     MatMulBackwardWeights, LayerNormBackward, AdamW,
     GELUBackward, ReduceSumAxis0, MatMulBackwardInput
 )
+from core.mha_ops import get_shared_mha_module, THREADS_PER_BLOCK as MHA_THREADS_PER_BLOCK, \
+    SOFTMAX_BLOCK_THREADS as MHA_SOFTMAX_BLOCK_THREADS
 
 
 
@@ -482,8 +484,10 @@ class MultiHeadAttention:
     Key optimizations for Kepler VRAM:
     1. Compact QKV projection: Single [C, 3C] weight matrix instead of three [C, C] matrices
     2. Pointer arithmetic: Q, K, V split using byte offsets (no separate allocations)
-    3. Strided operations: Batched matmuls exploit multi-head layout for efficiency
-    4. Causal masking: Fused into softmax kernel to reduce global memory traffic
+    3. GPU-resident forward: layout adapters (split/merge heads) and the fused
+       QKt+softmax / softmax+PV kernels run entirely on-device, with no
+       intermediate CPU round trips or numpy reshape/transpose calls.
+    4. Causal masking: Fused into the score+softmax kernel to reduce global memory traffic
     """
     _fallback_warned = False
 
@@ -506,9 +510,14 @@ class MultiHeadAttention:
         self.c_proj_b = Parameter((C,), init_scale=0.0)
         
         self.matmul_op = MatMul2D()
-        self.strided_matmul_op = MatmulStrided()
-        self.softmax_op = CausalSoftmax()
         self.add_op = ElementwiseAdd()
+
+        # GPU-resident attention kernels (Phase 2A/2B fusion + Phase 3 layout adapters),
+        # shared/compiled once across all MultiHeadAttention instances/layers.
+        mha_module = get_shared_mha_module()
+        self._fn_split_heads = mha_module.get_function("split_heads_kernel")
+        self._fn_fused_attention_forward = mha_module.get_function("fused_attention_forward_kernel")
+        self._fn_merge_heads = mha_module.get_function("merge_heads_kernel")
         
         # Cache intermediates for backward pass
         self.cache_input = None
@@ -547,76 +556,76 @@ class MultiHeadAttention:
         self.cache_input = host_input
 
         gpu_qkv = self.matmul_op(gpu_input, self.c_attn_w.gpu_weights, self.c_attn_b.gpu_weights, M, C * 3, C)
-        host_qkv = np.empty((M, C * 3), dtype=np.float32)
-        cuda.memcpy_dtoh(host_qkv, gpu_qkv)
+
+        BNH = B * NH
+        scale = float(1.0 / np.sqrt(HD))
+        threads = MHA_THREADS_PER_BLOCK
+        softmax_threads = MHA_SOFTMAX_BLOCK_THREADS
+        layout_total = B * T * NH * HD
+        layout_blocks = (layout_total + threads - 1) // threads
+
+        gpu_Q = cuda.mem_alloc(BNH * T * HD * 4)
+        gpu_K = cuda.mem_alloc(BNH * T * HD * 4)
+        gpu_V = cuda.mem_alloc(BNH * T * HD * 4)
+        gpu_scores = cuda.mem_alloc(BNH * T * T * 4)
+        gpu_row_max = cuda.mem_alloc(BNH * T * 4)
+        gpu_row_sum = cuda.mem_alloc(BNH * T * 4)
+        gpu_context_heads = cuda.mem_alloc(BNH * T * HD * 4)
+        gpu_context = cuda.mem_alloc(M * C * 4)
+
+        # Layout adapter: [B*T, 3C] shared projection -> contiguous Q/K/V[B*NH, T, HD],
+        # entirely GPU-resident (replaces CPU np.split + reshape + transpose).
+        self._fn_split_heads(gpu_qkv, gpu_Q, gpu_K, gpu_V,
+                              np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+                              block=(threads, 1, 1), grid=(layout_blocks, 1))
         gpu_qkv.free()
 
-        host_qkv = host_qkv.reshape(B, T, C * 3)
-        host_q, host_k, host_v = np.split(host_qkv, 3, axis=2)
-        host_q = np.ascontiguousarray(host_q.reshape(B, T, NH, HD).transpose(0, 2, 1, 3))
-        host_k = np.ascontiguousarray(host_k.reshape(B, T, NH, HD).transpose(0, 2, 1, 3))
-        host_v = np.ascontiguousarray(host_v.reshape(B, T, NH, HD).transpose(0, 2, 1, 3))
+        # Fused QKt + causal softmax + PV projection (Phase 2C): H=B*NH, M=T, D=HD,
+        # single launch -- the normalized probs row never leaves shared memory
+        # between the softmax and PV steps (Scores is still written for the
+        # cache_attn_weights download below, but never re-read by the kernel).
+        fused_shared_bytes = (HD + T + softmax_threads) * 4
+        self._fn_fused_attention_forward(gpu_Q, gpu_K, gpu_V, gpu_scores, gpu_context_heads,
+                                          gpu_row_max, gpu_row_sum,
+                                          np.int32(BNH), np.int32(T), np.int32(HD), np.float32(scale),
+                                          block=(softmax_threads, 1, 1), grid=(BNH, T),
+                                          shared=fused_shared_bytes)
 
+        # Layout adapter: ContextHeads[B*NH, T, HD] -> Context[B*T, C], GPU-resident
+        # (replaces CPU reshape + transpose + reshape merge).
+        self._fn_merge_heads(gpu_context_heads, gpu_context,
+                              np.int32(B), np.int32(T), np.int32(NH), np.int32(HD),
+                              block=(threads, 1, 1), grid=(layout_blocks, 1))
+
+        # Download backward-pass caches. [B*NH, T, HD]/[B*NH, T, T] are already
+        # (B, NH, T, HD)/(B, NH, T, T) in row-major memory -- a free reshape,
+        # no transpose needed -- matching the shapes backward() expects.
+        host_q = np.empty((B, NH, T, HD), dtype=np.float32)
+        host_k = np.empty((B, NH, T, HD), dtype=np.float32)
+        host_v = np.empty((B, NH, T, HD), dtype=np.float32)
+        cuda.memcpy_dtoh(host_q, gpu_Q)
+        cuda.memcpy_dtoh(host_k, gpu_K)
+        cuda.memcpy_dtoh(host_v, gpu_V)
         self.cache_q = host_q
         self.cache_k = host_k
         self.cache_v = host_v
 
-        host_q_flat = np.ascontiguousarray(host_q.reshape(B * NH, T, HD))
-        host_k_t_flat = np.ascontiguousarray(host_k.transpose(0, 1, 3, 2).reshape(B * NH, HD, T))
-        host_v_flat = np.ascontiguousarray(host_v.reshape(B * NH, T, HD))
-
-        gpu_q = cuda.mem_alloc(host_q_flat.nbytes)
-        gpu_k_t = cuda.mem_alloc(host_k_t_flat.nbytes)
-        gpu_v = cuda.mem_alloc(host_v_flat.nbytes)
-        cuda.memcpy_htod(gpu_q, host_q_flat)
-        cuda.memcpy_htod(gpu_k_t, host_k_t_flat)
-        cuda.memcpy_htod(gpu_v, host_v_flat)
-
-        gpu_scores = self.strided_matmul_op(
-            gpu_q,
-            gpu_k_t,
-            B,
-            NH,
-            T,
-            T,
-            HD,
-            T * HD,
-            HD * T,
-            T * T,
-        )
-        self.softmax_op(gpu_scores, B * NH * T, T, float(1.0 / np.sqrt(HD)))
-
-        host_attn_weights = np.empty((B * NH, T, T), dtype=np.float32)
+        host_attn_weights = np.empty((B, NH, T, T), dtype=np.float32)
         cuda.memcpy_dtoh(host_attn_weights, gpu_scores)
+        self.cache_attn_weights = host_attn_weights
 
-        gpu_context_heads = self.strided_matmul_op(
-            gpu_scores,
-            gpu_v,
-            B,
-            NH,
-            T,
-            HD,
-            T,
-            T * T,
-            T * HD,
-            T * HD,
-        )
-        host_context_heads = np.empty((B * NH, T, HD), dtype=np.float32)
-        cuda.memcpy_dtoh(host_context_heads, gpu_context_heads)
-
-        gpu_q.free()
-        gpu_k_t.free()
-        gpu_v.free()
-        gpu_scores.free()
-        gpu_context_heads.free()
-
-        self.cache_attn_weights = host_attn_weights.reshape(B, NH, T, T)
-        host_context = host_context_heads.reshape(B, NH, T, HD)
-        host_context_merged = np.ascontiguousarray(host_context.transpose(0, 2, 1, 3).reshape(M, C))
+        host_context_merged = np.empty((M, C), dtype=np.float32)
+        cuda.memcpy_dtoh(host_context_merged, gpu_context)
         self.cache_context = host_context_merged
 
-        gpu_context = cuda.mem_alloc(host_context_merged.nbytes)
-        cuda.memcpy_htod(gpu_context, host_context_merged)
+        gpu_Q.free()
+        gpu_K.free()
+        gpu_V.free()
+        gpu_scores.free()
+        gpu_row_max.free()
+        gpu_row_sum.free()
+        gpu_context_heads.free()
+
         gpu_output = self.matmul_op(gpu_context, self.c_proj_w.gpu_weights, self.c_proj_b.gpu_weights, M, C, C)
         gpu_context.free()
         return gpu_output

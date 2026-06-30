@@ -39,6 +39,88 @@ PARAMETER_PRESET_ASSUMED_VOCAB = 156
 PARAMETER_PRESET_ASSUMED_CTX = 128
 from run_config import RunConfig
 
+# --- Per-preset "cost card" estimates (VRAM / throughput / representation risk) ---
+# These are deliberately simple, deterministic heuristics (not measured benchmarks)
+# calibrated against the vocab size this project actually trains against, so the
+# AutoTrain menu can warn about config -> behavior mismatches (e.g. large vocab +
+# small embedding_dim => token-boundary fragmentation) before a run is launched,
+# not after a long training run produces unreadable text.
+ESTIMATE_VOCAB_SIZE = 4096       # realistic deployed vocab size, independent of any one corpus
+ESTIMATE_AVAILABLE_VRAM_MB = 3500  # GT730 4GB DDR3 budget used elsewhere in this file
+
+# Throughput baseline: embed=32, 1 layer, seq_len=128 measured at ~2000 tok/s in
+# project logs. Relative cost scales roughly with layers * embedding_dim^2 * seq_len
+# (dominant term in the QKV/FFN matmul FLOP counts); num_heads does not change total
+# FLOPs (just how they're split), so it is intentionally excluded from this estimate.
+THROUGHPUT_BASELINE_TOKPS = 2000.0
+THROUGHPUT_BASELINE_EMBED = 32
+THROUGHPUT_BASELINE_LAYERS = 1
+THROUGHPUT_BASELINE_SEQLEN = 128
+
+
+def estimate_tokens_per_sec(embedding_dim, num_layers, seq_len=PARAMETER_PRESET_ASSUMED_CTX):
+    """Rough relative throughput estimate, calibrated to one measured baseline.
+
+    Not a guarantee -- actual tok/s also depends on batch size, grad_accum,
+    kernel-launch overhead, and PCIe/host-side bottlenecks not modeled here.
+    """
+    relative_cost = (
+        (num_layers / THROUGHPUT_BASELINE_LAYERS) *
+        ((embedding_dim / THROUGHPUT_BASELINE_EMBED) ** 2) *
+        (seq_len / THROUGHPUT_BASELINE_SEQLEN)
+    )
+    relative_cost = max(relative_cost, 1e-6)
+    return THROUGHPUT_BASELINE_TOKPS / relative_cost
+
+
+def embedding_vocab_ratio(embedding_dim, vocab_size=ESTIMATE_VOCAB_SIZE):
+    """Representation-adequacy score: embedding dimensions available per bit of
+    vocabulary entropy (log2(vocab_size)). Low ratios mean tokens are packed too
+    tightly into the embedding space to stay well-separated -- the root cause of
+    the token-boundary-fusion artifacts ("andthe", "Heher") observed in this project
+    at vocab=4096 with embedding_dim=32."""
+    import math
+    return embedding_dim / max(1.0, math.log2(max(vocab_size, 2)))
+
+
+def classify_collapse_risk(embedding_dim, num_layers, vocab_size=ESTIMATE_VOCAB_SIZE):
+    """Heuristic collapse-risk label combining representation adequacy (embedding
+    vs. vocab entropy) and depth (shallow models are more prone to repetition /
+    attractor collapse, independent of embedding size)."""
+    ratio = embedding_vocab_ratio(embedding_dim, vocab_size)
+    if ratio < 3.0:
+        risk = "HIGH (token-boundary fragmentation likely at this vocab size)"
+    elif ratio < 5.0:
+        risk = "MODERATE (borderline representational capacity)"
+    else:
+        risk = "LOW"
+    if num_layers <= 1:
+        risk += "; shallow depth raises repetition/attractor-collapse risk"
+    return risk
+
+
+def build_preset_cost_card(embedding_dim, num_heads, num_layers,
+                            seq_len=PARAMETER_PRESET_ASSUMED_CTX,
+                            vocab_size=ESTIMATE_VOCAB_SIZE):
+    """Compute the full per-preset cost card: VRAM, throughput, and collapse risk,
+    all estimated at a fixed reference vocab_size/seq_len so presets are directly
+    comparable to each other in the AutoTrain menu."""
+    model_vram_mb, training_vram_mb, total_vram_mb = estimate_vram_usage(
+        vocab_size=vocab_size,
+        embedding_dim=embedding_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        batch_size=1,
+        seq_len=seq_len,
+    )
+    return {
+        "total_vram_mb": total_vram_mb,
+        "vram_pct_of_budget": 100.0 * total_vram_mb / ESTIMATE_AVAILABLE_VRAM_MB,
+        "tokens_per_sec": estimate_tokens_per_sec(embedding_dim, num_layers, seq_len),
+        "embedding_ratio": embedding_vocab_ratio(embedding_dim, vocab_size),
+        "collapse_risk": classify_collapse_risk(embedding_dim, num_layers, vocab_size),
+    }
+
 # Load model architecture presets from config file
 MODEL_SIZE_PRESETS = RunConfig.load_presets(os.path.join(os.path.dirname(__file__), "config", "presets_gt730_v2.json"))
 
@@ -829,17 +911,29 @@ class InteractiveTrainer:
 
         print(f"\n[OK] Selected tier: {selected_tier.replace('_', ' ').upper()}")
         print(f"[INFO] Preset parameter counts are approximate (vocab~{PARAMETER_PRESET_ASSUMED_VOCAB}, ctx={PARAMETER_PRESET_ASSUMED_CTX}).")
+        print(f"[INFO] Cost-card estimates below (VRAM/speed/risk) are calibrated at the project's "
+              f"real deployed vocab (~{ESTIMATE_VOCAB_SIZE}) and ctx={PARAMETER_PRESET_ASSUMED_CTX}, "
+              f"and are rough heuristics, not measured benchmarks.")
         print("\nAvailable models in this tier:")
 
         for preset in tier_presets:
             config = presets[preset['key']]
             recommended = " [RECOMMENDED]" if preset['key'] == "3" else ""
+            cost_card = build_preset_cost_card(
+                config['embedding_dim'], config['num_heads'], config['num_layers']
+            )
             print(
                 f"  {preset['key']}) {config['name'].upper():7} - "
                 f"{format_param_count(config['approx_params']):>7} params | "
                 f"{config['embedding_dim']:>3}D, {config['num_heads']:>2} heads, {config['num_layers']} layer{'s' if config['num_layers'] > 1 else ''} | "
                 f"{config['note']}{recommended}"
             )
+            print(
+                f"       VRAM: ~{cost_card['total_vram_mb']:.0f}MB ({cost_card['vram_pct_of_budget']:.0f}% of {ESTIMATE_AVAILABLE_VRAM_MB}MB budget) | "
+                f"Speed: ~{cost_card['tokens_per_sec']:.0f} tok/s (est.) | "
+                f"Embed/vocab ratio: {cost_card['embedding_ratio']:.1f}"
+            )
+            print(f"       Collapse risk @ vocab~{ESTIMATE_VOCAB_SIZE}: {cost_card['collapse_risk']}")
 
         default_choice = tier_presets[0]['key']
         choice = input(f"\nSelect model [{tier_presets[0]['key']}-{tier_presets[-1]['key']}] (default: {default_choice}): ").strip() or default_choice
@@ -1068,6 +1162,13 @@ class InteractiveTrainer:
         print(f"  Heads:        {self.config['num_heads']}")
         print(f"  Layers:       {self.config['num_layers']}")
         print(f"  Attention:    {self.config['attention_impl']}")
+
+        cost_card = build_preset_cost_card(
+            self.config['embedding_dim'], self.config['num_heads'], self.config['num_layers']
+        )
+        print(f"  Est. VRAM:    ~{cost_card['total_vram_mb']:.0f}MB ({cost_card['vram_pct_of_budget']:.0f}% of {ESTIMATE_AVAILABLE_VRAM_MB}MB budget, @vocab~{ESTIMATE_VOCAB_SIZE})")
+        print(f"  Est. speed:   ~{cost_card['tokens_per_sec']:.0f} tok/s (rough heuristic)")
+        print(f"  Collapse risk: {cost_card['collapse_risk']}")
         
         print(f"\nTraining:")
         print(f"  LR:           {self.config['learning_rate']}")

@@ -3,7 +3,7 @@
     "shallow": [
       {"key": "1", "name": "micro", "embedding_dim": 16, "num_heads": 1, "num_layers": 1, "note": "smoke tests"},
       {"key": "2", "name": "tiny", "embedding_dim": 32, "num_heads": 2, "num_layers": 1, "note": "quick debug runs"},
-      {"key": "3", "name": "small", "embedding_dim": 32, "num_heads": 4, "num_layers": 2, "note": "recommended GT730 baseline"}
+      {"key": "3", "name": "small", "embedding_dim": 64, "num_heads": 4, "num_layers": 2, "note": "recommended GT730 baseline (embedding_dim raised 32->64 to match 4096-token vocab and avoid token-boundary collapse)"}
     ],
     "knee_deep": [
       {"key": "4", "name": "base", "embedding_dim": 128, "num_heads": 8, "num_layers": 2, "note": "practical multi-layer"},

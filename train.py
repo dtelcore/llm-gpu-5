@@ -260,9 +260,11 @@ def run_training_engine():
                 # --- PHASE B: LOSS COMPUTATION & INITIAL GRADIENTS DERIVATION ---
                 if profiler is not None:
                     with profiler.zone("loss"):
-                        micro_loss, gpu_dLogits = criterion(gpu_logits, gpu_target_tokens, N, V)
+                        micro_loss, gpu_dLogits = criterion(gpu_logits, gpu_target_tokens, N, V,
+                                                             label_smoothing=run_config.label_smoothing)
                 else:
-                    micro_loss, gpu_dLogits = criterion(gpu_logits, gpu_target_tokens, N, V)
+                    micro_loss, gpu_dLogits = criterion(gpu_logits, gpu_target_tokens, N, V,
+                                                         label_smoothing=run_config.label_smoothing)
                 gpu_logits.free()
                 
                 step_loss_value += micro_loss / grad_accum
@@ -312,7 +314,8 @@ def run_training_engine():
             should_validate = step % run_config.val_interval == 0 or step == total_steps
             if should_validate:
                 val_logits = model.forward(gpu_val_input_tokens, val_batch_size, T)
-                val_loss, gpu_val_dLogits = criterion(val_logits, gpu_val_target_tokens, val_batch_size * T, V)
+                val_loss, gpu_val_dLogits = criterion(val_logits, gpu_val_target_tokens, val_batch_size * T, V,
+                                                       label_smoothing=run_config.label_smoothing)
                 val_logits.free()
                 gpu_val_dLogits.free()
                 model.free_forward_caches()

@@ -29,7 +29,8 @@ extern "C" {
         float* __restrict__ d_dLogits,         // Output loss gradients matrix: shape (N, V)
         const int N,                           // Total sequence items across batch (B * T)
         const int V,                           // Vocabulary size dimensions
-        const int pad_token_id                 // Token ID to ignore in loss (typically PAD/BOS)
+        const int pad_token_id,                // Token ID to ignore in loss (typically PAD/BOS)
+        const float label_smoothing            // 0.0 = hard target (original behavior), >0 = smoothed
     ) {
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= N) return;
@@ -56,24 +57,44 @@ extern "C" {
             }
         }
 
-        // 2. Compute normalizer sum of exponentials safely
+        // 2. Compute normalizer sum of exponentials safely, and (if label smoothing is
+        //    enabled) accumulate the sum of shifted logits needed for the smoothed
+        //    cross-entropy term -sum_v log(prob_v), without a second pass over V.
         float sum_exp = 0.0f;
+        float sum_shifted_logits = 0.0f;
         for (int v = 0; v < V; ++v) {
-            sum_exp += __expf(d_logits[row_offset + v] - max_val);
+            float shifted = d_logits[row_offset + v] - max_val;
+            sum_exp += __expf(shifted);
+            sum_shifted_logits += shifted;
+        }
+        float log_sum_exp = __logf(sum_exp);
+
+        // 3. Calculate the loss for this row. With label_smoothing == 0.0 this reduces
+        //    exactly to the original hard-target negative log-likelihood.
+        float target_logit = d_logits[row_offset + target_label];
+        float nll_target = log_sum_exp - (target_logit - max_val);
+
+        if (label_smoothing > 0.0f) {
+            // Smoothed target distribution: (1-eps) on the correct class, eps/V uniformly.
+            // CE against it: (1-eps)*nll_target + (eps/V) * sum_v [log_sum_exp - shifted_v]
+            float mean_nll_all = log_sum_exp - sum_shifted_logits / (float)V;
+            d_losses[idx] = (1.0f - label_smoothing) * nll_target + label_smoothing * mean_nll_all;
+        } else {
+            d_losses[idx] = nll_target;
         }
 
-        // 3. Calculate negative log-likelihood loss for this specific row item
-        float target_logit = d_logits[row_offset + target_label];
-        d_losses[idx] = __logf(sum_exp) - (target_logit - max_val);
-
         // 4. Derive downstream softmax probabilities and build matching gradient distributions
-        // Formula: dLogits[i, j] = (prob[j] - Indicator(j == target)) / N
+        // Hard-target formula:     dLogits[i, j] = (prob[j] - Indicator(j == target)) / N
+        // Smoothed-target formula: dLogits[i, j] = (prob[j] - target_prob[j]) / N
+        //   target_prob[j] = (1 - eps) + eps/V  for j == target,  eps/V otherwise.
+        float smooth_uniform = label_smoothing / (float)V;
         for (int v = 0; v < V; ++v) {
             float prob = __expf(d_logits[row_offset + v] - max_val) / sum_exp;
             float indicator = (v == target_label) ? 1.0f : 0.0f;
-            
+            float target_prob = indicator * (1.0f - label_smoothing) + smooth_uniform;
+
             // Standardized normalization over total sequence instances (N) to match batch means
-            d_dLogits[row_offset + v] = (prob - indicator) / (float)N;
+            d_dLogits[row_offset + v] = (prob - target_prob) / (float)N;
         }
     }
 }
@@ -102,7 +123,8 @@ class SoftmaxCrossEntropy:
         self.mod = SourceModule(FUSED_LOSS_KERNEL, options=nvcc_options)
         self.func = self.mod.get_function("fused_softmax_cross_entropy_kernel")
 
-    def __call__(self, gpu_logits, gpu_targets, N: int, V: int, pad_token_id: int = -1):
+    def __call__(self, gpu_logits, gpu_targets, N: int, V: int, pad_token_id: int = -1,
+                 label_smoothing: float = 0.0):
         """Execute parallel loss metrics calculation and gradient derivation.
         
         Args:
@@ -111,6 +133,9 @@ class SoftmaxCrossEntropy:
             N: Total sequence positions (B * T)
             V: Vocabulary size
             pad_token_id: Token ID to mask during loss calculation (default: -1 = no masking)
+            label_smoothing: Smoothing factor in [0, 1). 0.0 (default) reproduces the
+                original hard-target cross-entropy exactly. >0 blends in a uniform
+                target distribution over the vocabulary to reduce overconfidence.
             
         Returns:
             host_mean_loss (float): Averaged batch loss scalar pulled from VRAM
@@ -127,7 +152,7 @@ class SoftmaxCrossEntropy:
         # Launch fused kernel with PAD token masking
         self.func(
             gpu_logits, gpu_targets, gpu_losses, gpu_dLogits,
-            np.int32(N), np.int32(V), np.int32(pad_token_id),
+            np.int32(N), np.int32(V), np.int32(pad_token_id), np.float32(label_smoothing),
             block=(threads, 1, 1), grid=(blocks, 1)
         )
         

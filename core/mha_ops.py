@@ -33,6 +33,21 @@ def compile_mha_module():
     return SourceModule(MHA_KERNELS_STRING, options=nvcc_options)
 
 
+_SHARED_MHA_MODULE = None
+
+
+def get_shared_mha_module():
+    """Lazily-compiled, process-wide singleton MHA kernel module.
+
+    Used by model/gpt.py's MultiHeadAttention so every transformer layer
+    shares one compiled module instead of re-running nvcc per layer.
+    """
+    global _SHARED_MHA_MODULE
+    if _SHARED_MHA_MODULE is None:
+        _SHARED_MHA_MODULE = compile_mha_module()
+    return _SHARED_MHA_MODULE
+
+
 def _grid1d(total_elements, threads=THREADS_PER_BLOCK):
     return (total_elements + threads - 1) // threads
 
@@ -55,7 +70,10 @@ class MHAController:
         self.fn_split_qkv = self.module.get_function("split_qkv_kernel")
         self.fn_matmul_score = self.module.get_function("matmul_score_kernel")
         self.fn_softmax_fwd = self.module.get_function("softmax_fused_forward")
+        self.fn_score_softmax_fused = self.module.get_function("matmul_score_softmax_fused_forward")
         self.fn_matmul_proj = self.module.get_function("matmul_proj_kernel")
+        self.fn_softmax_pv_fused = self.module.get_function("softmax_pv_fused_kernel")
+        self.fn_fused_attention_forward = self.module.get_function("fused_attention_forward_kernel")
 
     def matmul_qkv_fused(self, gpu_X, gpu_W, gpu_fused, Din: int, block, grid):
         """Thin pass-through wrapper kept for harnesses that want to call the
@@ -102,18 +120,11 @@ class MHAController:
                                np.int32(H), np.int32(M), np.int32(D),
                                block=(THREADS_PER_BLOCK, 1, 1), grid=(_grid1d(H * M * D), 1))
 
-            self.fn_matmul_score(gpu_Q, gpu_K, gpu_scores,
-                                  np.int32(H), np.int32(M), np.int32(D), np.float32(self.scale),
-                                  block=(THREADS_PER_BLOCK, 1, 1), grid=(_grid1d(H * M * M), 1))
-
-            self.fn_softmax_fwd(gpu_scores, gpu_row_max, gpu_row_sum,
-                                 np.int32(H), np.int32(M),
-                                 block=(SOFTMAX_BLOCK_THREADS, 1, 1), grid=(H, M),
-                                 shared=SOFTMAX_BLOCK_THREADS * 4)
-
-            self.fn_matmul_proj(gpu_scores, gpu_V, gpu_out,
-                                 np.int32(H), np.int32(M), np.int32(D),
-                                 block=(THREADS_PER_BLOCK, 1, 1), grid=(_grid1d(H * M * D), 1))
+            fused_shared_bytes = (D + M + SOFTMAX_BLOCK_THREADS) * 4
+            self.fn_fused_attention_forward(gpu_Q, gpu_K, gpu_V, gpu_scores, gpu_out, gpu_row_max, gpu_row_sum,
+                                             np.int32(H), np.int32(M), np.int32(D), np.float32(self.scale),
+                                             block=(SOFTMAX_BLOCK_THREADS, 1, 1), grid=(H, M),
+                                             shared=fused_shared_bytes)
 
             out = np.empty((H, M, D), dtype=np.float32)
             probs = np.empty((H, M, M), dtype=np.float32)

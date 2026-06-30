@@ -308,6 +308,206 @@ def run_controller_execution_identity(module, X, W_qkv, Din):
     return all_passed
 
 
+def run_score_softmax_fusion_parity(module):
+    """Layer 4 (Phase 2A): compares the unfused two-kernel sequence
+    (matmul_score_kernel -> softmax_fused_forward) against the new
+    SMEM-resident matmul_score_softmax_fused_forward kernel. Catches:
+    shared-memory indexing bugs, causal-mask boundary errors, and any
+    drift introduced by moving the raw-score round trip out of HBM."""
+    print(f"\n--- Layer 4: score+softmax fusion parity (Phase 2A) ---")
+
+    matmul_score = module.get_function("matmul_score_kernel")
+    softmax_fwd = module.get_function("softmax_fused_forward")
+    score_softmax_fused = module.get_function("matmul_score_softmax_fused_forward")
+
+    Q = np.random.normal(0.0, 1.0, size=(H, M, D)).astype(np.float32)
+    K = np.random.normal(0.0, 1.0, size=(H, M, D)).astype(np.float32)
+
+    threads = 256
+    score_blocks = (H * M * M + threads - 1) // threads
+    softmax_block_threads = SOFTMAX_BLOCK_THREADS
+    softmax_shared_bytes = softmax_block_threads * 4
+    fused_shared_bytes = (D + M + softmax_block_threads) * 4
+
+    gpu_Q, gpu_K = _to_gpu(Q), _to_gpu(K)
+
+    # --- unfused (existing) sequence ---
+    gpu_scores_unfused = cuda.mem_alloc(H * M * M * 4)
+    gpu_row_max_unfused = cuda.mem_alloc(H * M * 4)
+    gpu_row_sum_unfused = cuda.mem_alloc(H * M * 4)
+
+    matmul_score(gpu_Q, gpu_K, gpu_scores_unfused, np.int32(H), np.int32(M), np.int32(D), np.float32(SCALE),
+                 block=(threads, 1, 1), grid=(score_blocks, 1))
+    softmax_fwd(gpu_scores_unfused, gpu_row_max_unfused, gpu_row_sum_unfused, np.int32(H), np.int32(M),
+                block=(softmax_block_threads, 1, 1), grid=(H, M), shared=softmax_shared_bytes)
+
+    probs_unfused = _from_gpu(gpu_scores_unfused, (H, M, M))
+    row_max_unfused = _from_gpu(gpu_row_max_unfused, (H, M))
+    row_sum_unfused = _from_gpu(gpu_row_sum_unfused, (H, M))
+
+    # --- fused (Phase 2A) kernel ---
+    gpu_scores_fused = cuda.mem_alloc(H * M * M * 4)
+    gpu_row_max_fused = cuda.mem_alloc(H * M * 4)
+    gpu_row_sum_fused = cuda.mem_alloc(H * M * 4)
+
+    score_softmax_fused(gpu_Q, gpu_K, gpu_scores_fused, gpu_row_max_fused, gpu_row_sum_fused,
+                         np.int32(H), np.int32(M), np.int32(D), np.float32(SCALE),
+                         block=(softmax_block_threads, 1, 1), grid=(H, M), shared=fused_shared_bytes)
+
+    probs_fused = _from_gpu(gpu_scores_fused, (H, M, M))
+    row_max_fused = _from_gpu(gpu_row_max_fused, (H, M))
+    row_sum_fused = _from_gpu(gpu_row_sum_fused, (H, M))
+
+    for ptr in (gpu_Q, gpu_K, gpu_scores_unfused, gpu_row_max_unfused, gpu_row_sum_unfused,
+                gpu_scores_fused, gpu_row_max_fused, gpu_row_sum_fused):
+        ptr.free()
+
+    checks = [
+        ("probs (fused-vs-unfused)", probs_unfused, probs_fused),
+        ("row_max (fused-vs-unfused)", row_max_unfused, row_max_fused),
+        ("row_sum (fused-vs-unfused)", row_sum_unfused, row_sum_fused),
+    ]
+
+    all_passed = True
+    for name, ref_val, gpu_val in checks:
+        try:
+            np.testing.assert_allclose(gpu_val, ref_val, **TOLERANCE)
+            max_abs_diff = float(np.max(np.abs(gpu_val - ref_val)))
+            print(f"[PASS] {name}: max_abs_diff={max_abs_diff:.3e}")
+        except AssertionError as exc:
+            all_passed = False
+            print(f"[FAIL] {name}: {exc}")
+
+    return all_passed
+
+
+def run_pv_fusion_parity(module):
+    """Layer 5 (Phase 2B): compares the unfused PV projection (matmul_proj_kernel)
+    against the row-residency fused softmax_pv_fused_kernel. Catches: shared-memory
+    probs-row caching bugs, causal-mask boundary errors in the PV reduction, and any
+    drift introduced by reusing one cached probs row across all D output columns."""
+    print(f"\n--- Layer 5: softmax-probs+PV fusion parity (Phase 2B) ---")
+
+    matmul_proj = module.get_function("matmul_proj_kernel")
+    softmax_pv_fused = module.get_function("softmax_pv_fused_kernel")
+
+    causal_mask = np.tril(np.ones((M, M), dtype=bool))
+    raw_probs = np.random.uniform(0.0, 1.0, size=(H, M, M)).astype(np.float64)
+    masked_probs = np.where(causal_mask[None, :, :], raw_probs, 0.0)
+    probs = (masked_probs / np.sum(masked_probs, axis=-1, keepdims=True)).astype(np.float32)
+    V = np.random.normal(0.0, 1.0, size=(H, M, D)).astype(np.float32)
+
+    threads = THREADS_PER_BLOCK
+    proj_blocks = (H * M * D + threads - 1) // threads
+    softmax_block_threads = SOFTMAX_BLOCK_THREADS
+    pv_shared_bytes = (M + softmax_block_threads) * 4
+
+    gpu_probs, gpu_V = _to_gpu(probs), _to_gpu(V)
+
+    gpu_out_unfused = cuda.mem_alloc(H * M * D * 4)
+    matmul_proj(gpu_probs, gpu_V, gpu_out_unfused, np.int32(H), np.int32(M), np.int32(D),
+                block=(threads, 1, 1), grid=(proj_blocks, 1))
+    out_unfused = _from_gpu(gpu_out_unfused, (H, M, D))
+
+    gpu_out_fused = cuda.mem_alloc(H * M * D * 4)
+    softmax_pv_fused(gpu_probs, gpu_V, gpu_out_fused, np.int32(H), np.int32(M), np.int32(D),
+                      block=(softmax_block_threads, 1, 1), grid=(H, M), shared=pv_shared_bytes)
+    out_fused = _from_gpu(gpu_out_fused, (H, M, D))
+
+    for ptr in (gpu_probs, gpu_V, gpu_out_unfused, gpu_out_fused):
+        ptr.free()
+
+    all_passed = True
+    try:
+        np.testing.assert_allclose(out_fused, out_unfused, **TOLERANCE)
+        max_abs_diff = float(np.max(np.abs(out_fused - out_unfused)))
+        print(f"[PASS] out (fused-vs-unfused PV): max_abs_diff={max_abs_diff:.3e}")
+    except AssertionError as exc:
+        all_passed = False
+        print(f"[FAIL] out (fused-vs-unfused PV): {exc}")
+
+    return all_passed
+
+
+def run_fused_attention_forward_parity(module):
+    """Layer 6 (Phase 2C): compares the existing two-kernel sequence
+    (matmul_score_softmax_fused_forward -> softmax_pv_fused_kernel) against the
+    single-launch fused_attention_forward_kernel. Catches: shared-memory reuse
+    bugs from merging the two kernels' scratch buffers, and any drift from the
+    PV step reading row_scores directly instead of re-loading probs from global."""
+    print(f"\n--- Layer 6: single-kernel fused attention forward parity (Phase 2C) ---")
+
+    score_softmax_fused = module.get_function("matmul_score_softmax_fused_forward")
+    softmax_pv_fused = module.get_function("softmax_pv_fused_kernel")
+    fused_attention_forward = module.get_function("fused_attention_forward_kernel")
+
+    Q = np.random.normal(0.0, 1.0, size=(H, M, D)).astype(np.float32)
+    K = np.random.normal(0.0, 1.0, size=(H, M, D)).astype(np.float32)
+    V = np.random.normal(0.0, 1.0, size=(H, M, D)).astype(np.float32)
+
+    softmax_block_threads = SOFTMAX_BLOCK_THREADS
+    fused_shared_bytes = (D + M + softmax_block_threads) * 4
+
+    gpu_Q, gpu_K, gpu_V = _to_gpu(Q), _to_gpu(K), _to_gpu(V)
+
+    # --- two-kernel sequence (existing, validated) ---
+    gpu_scores_2k = cuda.mem_alloc(H * M * M * 4)
+    gpu_row_max_2k = cuda.mem_alloc(H * M * 4)
+    gpu_row_sum_2k = cuda.mem_alloc(H * M * 4)
+    gpu_out_2k = cuda.mem_alloc(H * M * D * 4)
+
+    score_softmax_fused(gpu_Q, gpu_K, gpu_scores_2k, gpu_row_max_2k, gpu_row_sum_2k,
+                         np.int32(H), np.int32(M), np.int32(D), np.float32(SCALE),
+                         block=(softmax_block_threads, 1, 1), grid=(H, M), shared=fused_shared_bytes)
+    pv_shared_bytes = (M + softmax_block_threads) * 4
+    softmax_pv_fused(gpu_scores_2k, gpu_V, gpu_out_2k, np.int32(H), np.int32(M), np.int32(D),
+                      block=(softmax_block_threads, 1, 1), grid=(H, M), shared=pv_shared_bytes)
+
+    probs_2k = _from_gpu(gpu_scores_2k, (H, M, M))
+    row_max_2k = _from_gpu(gpu_row_max_2k, (H, M))
+    row_sum_2k = _from_gpu(gpu_row_sum_2k, (H, M))
+    out_2k = _from_gpu(gpu_out_2k, (H, M, D))
+
+    # --- single fused kernel (Phase 2C) ---
+    gpu_scores_1k = cuda.mem_alloc(H * M * M * 4)
+    gpu_row_max_1k = cuda.mem_alloc(H * M * 4)
+    gpu_row_sum_1k = cuda.mem_alloc(H * M * 4)
+    gpu_out_1k = cuda.mem_alloc(H * M * D * 4)
+
+    fused_attention_forward(gpu_Q, gpu_K, gpu_V, gpu_scores_1k, gpu_out_1k, gpu_row_max_1k, gpu_row_sum_1k,
+                             np.int32(H), np.int32(M), np.int32(D), np.float32(SCALE),
+                             block=(softmax_block_threads, 1, 1), grid=(H, M), shared=fused_shared_bytes)
+
+    probs_1k = _from_gpu(gpu_scores_1k, (H, M, M))
+    row_max_1k = _from_gpu(gpu_row_max_1k, (H, M))
+    row_sum_1k = _from_gpu(gpu_row_sum_1k, (H, M))
+    out_1k = _from_gpu(gpu_out_1k, (H, M, D))
+
+    for ptr in (gpu_Q, gpu_K, gpu_V,
+                gpu_scores_2k, gpu_row_max_2k, gpu_row_sum_2k, gpu_out_2k,
+                gpu_scores_1k, gpu_row_max_1k, gpu_row_sum_1k, gpu_out_1k):
+        ptr.free()
+
+    checks = [
+        ("probs (single-vs-two-kernel)", probs_2k, probs_1k),
+        ("row_max (single-vs-two-kernel)", row_max_2k, row_max_1k),
+        ("row_sum (single-vs-two-kernel)", row_sum_2k, row_sum_1k),
+        ("out (single-vs-two-kernel)", out_2k, out_1k),
+    ]
+
+    all_passed = True
+    for name, ref_val, gpu_val in checks:
+        try:
+            np.testing.assert_allclose(gpu_val, ref_val, **TOLERANCE)
+            max_abs_diff = float(np.max(np.abs(gpu_val - ref_val)))
+            print(f"[PASS] {name}: max_abs_diff={max_abs_diff:.3e}")
+        except AssertionError as exc:
+            all_passed = False
+            print(f"[FAIL] {name}: {exc}")
+
+    return all_passed
+
+
 def main():
     np.random.seed(SEED)
     module = compile_mha_module()
@@ -319,11 +519,21 @@ def main():
     layer1_passed = run_kernel_level_parity(module)
     layer2_passed = run_fused_qkv_representation_parity(module, X, W_qkv, Din)
     layer3_passed = run_controller_execution_identity(module, X, W_qkv, Din)
+    layer4_passed = run_score_softmax_fusion_parity(module)
+    layer5_passed = run_pv_fusion_parity(module)
+    layer6_passed = run_fused_attention_forward_parity(module)
+    # Re-run Layer 3 after Phase 2A/2B/2C: MHAController now uses the fully fused
+    # single-kernel attention forward internally, so this re-confirms production
+    # wiring still matches the NumPy oracle end-to-end with the new kernel in place.
+    layer3b_passed = run_controller_execution_identity(module, X, W_qkv, Din)
 
     print()
-    if layer1_passed and layer2_passed and layer3_passed:
-        print("ALL PARITY CHECKS PASSED: kernels, fused-QKV representation, and controller "
-              "wiring are all numerically equivalent. Safe to proceed with optimization work.")
+    if (layer1_passed and layer2_passed and layer3_passed and layer4_passed and layer5_passed
+            and layer6_passed and layer3b_passed):
+        print("ALL PARITY CHECKS PASSED: kernels, fused-QKV representation, controller "
+              "wiring, Phase 2A score+softmax fusion, Phase 2B softmax-probs+PV fusion, and "
+              "Phase 2C single-kernel fused attention forward are all numerically equivalent. "
+              "Safe to proceed with optimization work.")
     else:
         print("PARITY FAILED: see [FAIL] lines above. Do not delete triple-projection code "
               "or proceed to optimization until every layer passes.")
